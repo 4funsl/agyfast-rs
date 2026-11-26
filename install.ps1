@@ -9,7 +9,8 @@ $pluginDir = Join-Path $env:USERPROFILE ".gemini\config\plugins\agy-rs"
 $cliDir = Join-Path $env:USERPROFILE ".local\bin"
 $bin = Join-Path $root "target\release\agy-rs.exe"
 
-if (-not $SkipBuild) { & (Join-Path $root "build.ps1") }
+$bundled = Join-Path $root "agy-rs.exe" # release archive: the prebuilt binary sits next to this script
+if (Test-Path $bundled) { $bin = $bundled } elseif (-not $SkipBuild) { & (Join-Path $root "build.ps1") }
 if (-not (Test-Path $bin)) { throw "$bin not found; run .\build.ps1 first" }
 
 New-Item -ItemType Directory -Force -Path (Join-Path $pluginDir "bin"), (Join-Path $pluginDir "rules"), $cliDir | Out-Null

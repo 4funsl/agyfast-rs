@@ -32,7 +32,19 @@ waiting. The same binary is a plain CLI, so `/swarm` workers get the same tools.
 
 ## Install
 
-Requires a recent stable [Rust](https://rustup.rs) toolchain and Antigravity CLI.
+**Prebuilt binary (no Rust needed).** Download the archive for your system from
+[Releases](https://github.com/4funsl/agyfast-rs/releases) (macOS Apple Silicon and Intel, Linux
+x86-64, Windows x86-64), unpack it, and run the installer inside:
+
+```sh
+tar -xzf agy-rs-v*-aarch64-apple-darwin.tar.gz && cd agy-rs-v*-aarch64-apple-darwin
+./install.sh
+```
+
+On Windows unpack the `.zip` and run `.\install.ps1` in it. On macOS, an archive downloaded with
+a browser is quarantined: run `xattr -dr com.apple.quarantine .` in the unpacked folder first.
+
+**From source.** Requires a recent stable [Rust](https://rustup.rs) toolchain.
 
 **macOS / Linux**
 
@@ -48,7 +60,7 @@ git clone https://github.com/4funsl/agyfast-rs; cd agyfast-rs
 .\install.ps1
 ```
 
-The installer builds a release binary, installs the plugin to `~/.gemini/config/plugins/agy-rs`
+Either way the installer puts the plugin in `~/.gemini/config/plugins/agy-rs`
 and copies the CLI to `~/.local/bin`. Start a new Antigravity session and confirm with
 `agy plugin list`.
 

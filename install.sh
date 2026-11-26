@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build agy-rs and install the Antigravity plugin and the CLI. Safe to re-run.
+# Build agy-rs (or use the prebuilt binary of a release archive) and install the Antigravity plugin and the CLI. Safe to re-run.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -7,8 +7,12 @@ plugin_dir="$HOME/.gemini/config/plugins/agy-rs"
 cli_dir="$HOME/.local/bin"
 
 cd "$root"
-cargo build --release
-bin="$root/target/release/agy-rs"
+if [ -f "$root/agy-rs" ] && [ -x "$root/agy-rs" ]; then
+  bin="$root/agy-rs" # release archive: the prebuilt binary sits next to this script
+else
+  cargo build --release
+  bin="$root/target/release/agy-rs"
+fi
 
 mkdir -p "$plugin_dir/bin" "$cli_dir"
 for f in plugin.json mcp_config.json hooks.json; do

@@ -1,0 +1,64 @@
+name: release
+
+# Push a tag like v0.1.0 to build the binaries and publish a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest, target: aarch64-apple-darwin, test: true }
+          - { os: macos-latest, target: x86_64-apple-darwin, test: false }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, test: true }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, test: false }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup update stable && rustup default stable && rustup target add ${{ matrix.target }}
+      - name: Test
+        if: matrix.test
+        run: cargo test --locked
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          name="agy-rs-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$name"
+          cp -R plugin install.sh install.ps1 LICENSE README.md "$name/"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            cp "target/${{ matrix.target }}/release/agy-rs.exe" "$name/"
+            7z a "$name.zip" "$name" > /dev/null
+          else
+            cp "target/${{ matrix.target }}/release/agy-rs" "$name/"
+            tar -czf "$name.tar.gz" "$name"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            agy-rs-*.tar.gz
+            agy-rs-*.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha256sum agy-rs-* > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "agy-rs $GITHUB_REF_NAME" --generate-notes agy-rs-* SHA256SUMS
