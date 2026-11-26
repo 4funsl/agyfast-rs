@@ -1,0 +1,13 @@
+{
+  "name": "agy-rs",
+  "displayName": "agy-rs",
+  "version": "0.1.0",
+  "description": "Batched code search, outlines, atomic edits and compressed checks, plus a session snapshot, in one static binary.",
+  "license": "MIT",
+  "keywords": ["performance", "latency", "batch", "search", "edit", "mcp"],
+  "suggestedPrompts": [
+    "Outline these large files and show me the relevant symbols",
+    "Apply related edits across several files and run cargo check in one call",
+    "Run build, lint and tests concurrently with compact output"
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "mcpServers": {
+    "rs": {
+      "command": "sh",
+      "args": [
+        "-c",
+        "exec \"$0\" mcp",
+        "${PLUGIN_ROOT}/bin/agy-rs"
+      ],
+      "tools": {
+        "batch_search": {
+          "eager": true
+        },
+        "quick_outline": {
+          "eager": true
+        },
+        "apply_edits": {
+          "eager": true
+        },
+        "run_checks": {
+          "eager": true
+        }
+      }
+    }
+  }
+}
