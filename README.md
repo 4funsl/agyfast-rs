@@ -32,17 +32,30 @@ waiting. The same binary is a plain CLI, so `/swarm` workers get the same tools.
 
 ## Install
 
-**Prebuilt binary (no Rust needed).** Download the archive for your system from
-[Releases](https://github.com/4funsl/agyfast-rs/releases) (macOS Apple Silicon and Intel, Linux
-x86-64, Windows x86-64), unpack it, and run the installer inside:
+**Fast install: prebuilt binary, no Rust needed.** Paste one block; it downloads the latest
+[release](https://github.com/4funsl/agyfast-rs/releases/latest) for your system and installs it.
+
+**macOS (Apple Silicon and Intel) / Linux x86-64**
 
 ```sh
-tar -xzf agy-rs-v*-aarch64-apple-darwin.tar.gz && cd agy-rs-v*-aarch64-apple-darwin
-./install.sh
+t=$(uname -sm | sed 's/Darwin arm64/aarch64-apple-darwin/;s/Darwin x86_64/x86_64-apple-darwin/;s/Linux x86_64/x86_64-unknown-linux-gnu/')
+v=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/4funsl/agyfast-rs/releases/latest); v=${v##*/}
+curl -fsSL "https://github.com/4funsl/agyfast-rs/releases/download/$v/agy-rs-$v-$t.tar.gz" | tar -xz && "./agy-rs-$v-$t/install.sh"
 ```
 
-On Windows unpack the `.zip` and run `.\install.ps1` in it. On macOS, an archive downloaded with
-a browser is quarantined: run `xattr -dr com.apple.quarantine .` in the unpacked folder first.
+**Windows x86-64 (PowerShell)**
+
+```powershell
+$v = (irm https://api.github.com/repos/4funsl/agyfast-rs/releases/latest).tag_name
+$n = "agy-rs-$v-x86_64-pc-windows-msvc"
+iwr "https://github.com/4funsl/agyfast-rs/releases/download/$v/$n.zip" -OutFile "$n.zip"
+Expand-Archive "$n.zip" .; & ".\$n\install.ps1"
+```
+
+You can also download an archive by hand from
+[Releases](https://github.com/4funsl/agyfast-rs/releases), check it against `SHA256SUMS`, unpack it
+and run `./install.sh` (or `.\install.ps1`) inside. On macOS an archive downloaded with a browser
+is quarantined: run `xattr -dr com.apple.quarantine .` in the unpacked folder first.
 
 **From source.** Requires a recent stable [Rust](https://rustup.rs) toolchain.
 
