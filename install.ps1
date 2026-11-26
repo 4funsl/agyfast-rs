@@ -50,7 +50,7 @@ if (-not $rules.Contains($posixCmd)) { throw "plugin\rules\AGENTS.md no longer c
 Write-Host "Installed plugin: $pluginDir"
 Write-Host "Installed CLI:    $cliDir\agyfast-rs.exe"
 if (-not (($env:PATH -split ';') -contains $cliDir)) { Write-Host "Add $cliDir to PATH to call agyfast-rs from a terminal." }
-$gitSh = @("usr\bin", "bin") | ForEach-Object { Join-Path $env:ProgramFiles "Git\$_\sh.exe" } | Where-Object { Test-Path $_ }
+$gitSh = @("bin", "usr\bin") | ForEach-Object { Join-Path $env:ProgramFiles "Git\$_\sh.exe" } | Where-Object { Test-Path $_ }
 if (-not (Get-Command sh -ErrorAction SilentlyContinue) -and -not $gitSh) {
   Write-Warning "sh was not found (not on PATH, not in Git for Windows). run_checks and apply_edits' verify will run commands through cmd.exe, where POSIX shell syntax (quotes, &&, pipes to sh tools) may not work: install Git for Windows."
 }

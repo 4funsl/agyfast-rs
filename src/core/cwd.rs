@@ -26,11 +26,14 @@ pub fn key(p: &Path) -> OsString {
     if cfg!(windows) { p.to_string_lossy().to_lowercase().into() } else { p.as_os_str().to_owned() }
 }
 
-fn is_plugin_root(dir: &Path) -> bool {
-    let env_root = std::env::var_os("PLUGIN_ROOT")
-        .and_then(|p| PathBuf::from(p).canonicalize().ok());
+fn is_plugin_root_with(dir: &Path, env_root: Option<OsString>) -> bool {
+    let env_root = env_root.and_then(|p| PathBuf::from(p).canonicalize().ok()).map(simplify);
     env_root.as_deref() == Some(dir)
         || (dir.join("plugin.json").is_file() && dir.join("mcp_config.json").is_file())
+}
+
+fn is_plugin_root(dir: &Path) -> bool {
+    is_plugin_root_with(dir, std::env::var_os("PLUGIN_ROOT"))
 }
 
 /// Resolve the directory a tool call works in. An explicit `cwd` must be an
@@ -74,6 +77,12 @@ mod tests {
         std::fs::write(root.join("plugin.json"), "{}").unwrap();
         std::fs::write(root.join("mcp_config.json"), "{}").unwrap();
         assert!(is_plugin_root(&root));
+        let env_only = tmp.join("agyfast-rs-cwd-test-env-only");
+        std::fs::create_dir_all(&env_only).unwrap();
+        let resolved = resolve(env_only.to_str()).unwrap();
+        assert!(!is_plugin_root_with(&resolved, None));
+        assert!(is_plugin_root_with(&resolved, Some(env_only.as_os_str().to_os_string())));
+        let _ = std::fs::remove_dir_all(&env_only);
     }
 
     #[test]

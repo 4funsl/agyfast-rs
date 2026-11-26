@@ -157,6 +157,13 @@ pub fn snapshot(cwd: &Path) -> String {
     fold(&parts.join("\n"), MAX_BYTES)
 }
 
+fn strip_bom(mut bytes: &[u8]) -> &[u8] {
+    while let Some(rest) = bytes.strip_prefix(b"\xef\xbb\xbf") {
+        bytes = rest;
+    }
+    bytes
+}
+
 fn read_payload() -> Option<Value> {
     if std::io::stdin().is_terminal() {
         return None;
@@ -168,11 +175,11 @@ fn read_payload() -> Option<Value> {
         let mut stdin = std::io::stdin().lock();
         while let Ok(n) = stdin.read(&mut chunk) {
             buf.extend_from_slice(&chunk[..n]);
-            if n == 0 || buf.len() >= MAX_STDIN || serde_json::from_slice::<Value>(&buf).is_ok() {
+            if n == 0 || buf.len() >= MAX_STDIN || serde_json::from_slice::<Value>(strip_bom(&buf)).is_ok() {
                 break;
             }
         }
-        let _ = tx.send(serde_json::from_slice::<Value>(&buf).ok());
+        let _ = tx.send(serde_json::from_slice::<Value>(strip_bom(&buf)).ok());
     });
     rx.recv_timeout(Duration::from_millis(1500)).ok().flatten()
 }
@@ -284,5 +291,7 @@ mod tests {
         assert_eq!(workspace_dir(&agy).unwrap(), d.path());
         assert_eq!(response(&agy, "t")["injectSteps"][0]["systemMessage"]["systemMessage"], "t");
         assert!(workspace_dir(&json!({"cwd": "/definitely/not/here"})).is_none());
+        assert!(serde_json::from_slice::<Value>(strip_bom(b"\xef\xbb\xbf\xef\xbb\xbf{\"cwd\":\"/x\"}")).is_ok());
+        assert_eq!(strip_bom(b"{\"a\":1}"), b"{\"a\":1}");
     }
 }

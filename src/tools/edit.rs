@@ -267,7 +267,7 @@ fn plan(job: &Job) -> Result<Plan, String> {
 }
 
 /// Temp file in the target's directory, then rename over it: readers never see a partial file.
-fn write_atomic(path: &Path, bytes: &[u8], perms: Option<&Permissions>) -> io::Result<()> {
+fn write_atomic(path: &Path, bytes: &[u8], perms: Option<&Permissions>, #[cfg_attr(not(windows), allow(unused_variables))] replaced: &mut bool) -> io::Result<()> {
     let dir = path.parent().ok_or_else(|| io::Error::other("path has no parent directory"))?;
     fs::create_dir_all(dir)?;
     #[cfg_attr(not(unix), allow(unused_mut))] // only Unix sets permissions below
@@ -276,12 +276,13 @@ fn write_atomic(path: &Path, bytes: &[u8], perms: Option<&Permissions>) -> io::R
     builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o666)); // new files honour umask
     let mut tmp = builder.tempfile_in(dir)?;
     tmp.write_all(bytes)?;
+    #[cfg(not(windows))]
     if let Some(p) = perms {
         tmp.as_file().set_permissions(p.clone())?;
     }
     tmp.as_file().sync_all()?;
     #[cfg(windows)]
-    return persist_windows(tmp, path);
+    return persist_windows(tmp, path, perms, replaced);
     #[cfg(not(windows))]
     {
         tmp.persist(path).map_err(|e| e.error)?;
@@ -291,9 +292,10 @@ fn write_atomic(path: &Path, bytes: &[u8], perms: Option<&Permissions>) -> io::R
 
 /// Windows refuses to replace a read-only file, and Defender/indexers briefly lock fresh files
 /// (ERROR_ACCESS_DENIED 5 / ERROR_SHARING_VIOLATION 32), so clear read-only and retry.
+/// `tempfile`'s Windows `persist` resets attributes to `FILE_ATTRIBUTE_NORMAL`, so re-apply read-only after.
 #[cfg(windows)]
-fn persist_windows(mut tmp: tempfile::NamedTempFile, path: &Path) -> io::Result<()> {
-    // The temp file already carries the original permissions, so the read-only bit returns with the new content.
+fn persist_windows(mut tmp: tempfile::NamedTempFile, path: &Path, perms: Option<&Permissions>, replaced: &mut bool) -> io::Result<()> {
+    let is_busy = |e: &io::Error| e.kind() == io::ErrorKind::PermissionDenied || matches!(e.raw_os_error(), Some(5 | 32));
     let was_readonly = fs::metadata(path).ok().filter(|m| m.permissions().readonly());
     if let Some(m) = &was_readonly {
         let mut p = m.permissions();
@@ -303,10 +305,21 @@ fn persist_windows(mut tmp: tempfile::NamedTempFile, path: &Path) -> io::Result<
     }
     for attempt in 1..=8 {
         match tmp.persist(path) {
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                *replaced = true;
+                if let Some(p) = perms.filter(|p| p.readonly()) {
+                    for perm_attempt in 1..=8 {
+                        match fs::set_permissions(path, p.clone()) {
+                            Ok(()) => break,
+                            Err(e) if is_busy(&e) && perm_attempt < 8 => std::thread::sleep(std::time::Duration::from_millis(20)),
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
+                return Ok(());
+            }
             Err(e) => {
-                let busy = e.error.kind() == io::ErrorKind::PermissionDenied || matches!(e.error.raw_os_error(), Some(5 | 32));
-                if !busy || attempt == 8 {
+                if !is_busy(&e.error) || attempt == 8 {
                     if let Some(m) = was_readonly {
                         let _ = fs::set_permissions(path, m.permissions()); // target stays as it was
                     }
@@ -361,17 +374,29 @@ pub fn run(args: Value) -> Result<String, String> {
     if a.dry_run {
         return Ok(format!("Dry run: {} file(s) valid (0 files modified):\n{}", plans.len(), summaries.join("\n")));
     }
+    let rollback = |w: &Plan| {
+        let _ = match &w.old {
+            Some((bytes, perms)) => write_atomic(&w.path, bytes, Some(perms), &mut false),
+            None => fs::remove_file(&w.path),
+        };
+    };
     let mut written: Vec<&Plan> = Vec::new();
     for p in &plans {
-        match write_atomic(&p.path, &p.new, p.old.as_ref().map(|o| &o.1)) {
+        let mut replaced = false;
+        match write_atomic(&p.path, &p.new, p.old.as_ref().map(|o| &o.1), &mut replaced) {
             Ok(()) => written.push(p),
-            Err(e) if a.best_effort => failed.push(format!("{}: write failed: {e}", p.display)),
+            Err(e) if a.best_effort => {
+                if replaced {
+                    rollback(p);
+                }
+                failed.push(format!("{}: write failed: {e}", p.display));
+            }
             Err(e) => {
+                if replaced {
+                    written.push(p);
+                }
                 for w in &written {
-                    let _ = match &w.old {
-                        Some((bytes, perms)) => write_atomic(&w.path, bytes, Some(perms)),
-                        None => fs::remove_file(&w.path),
-                    };
+                    rollback(w);
                 }
                 return Err(format!("Error: write failed for {}: {e}; rolled back {} file(s) (0 files modified)", p.path.display(), written.len()));
             }
@@ -535,6 +560,21 @@ mod tests {
             assert_eq!(read(&d, "tool.sh"), "echo v2\n");
             symlink(d.path().join("nowhere"), d.path().join("dangling")).unwrap();
             assert!(edit(&d, json!({"edits": [{"path": "dangling", "create": "x"}]})).unwrap_err().contains("dangling"));
+        }
+        #[cfg(windows)]
+        {
+            let p = d.path().join("ro.txt");
+            fs::write(&p, "old\n").unwrap();
+            let mut ro = fs::metadata(&p).unwrap().permissions();
+            ro.set_readonly(true);
+            fs::set_permissions(&p, ro).unwrap();
+            edit(&d, json!({"edits": [{"path": "ro.txt", "hunks": [{"target": "old", "replacement": "new"}]}]})).unwrap();
+            assert_eq!(read(&d, "ro.txt"), "new\n");
+            let mut pms = fs::metadata(&p).unwrap().permissions();
+            assert!(pms.readonly(), "ReadOnly attribute was lost after edit");
+            #[allow(clippy::permissions_set_readonly_false)]
+            pms.set_readonly(false);
+            fs::set_permissions(&p, pms).unwrap();
         }
     }
 }

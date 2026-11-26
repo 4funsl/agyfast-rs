@@ -307,13 +307,15 @@ fn and_parts(command: &str, allow_merge: bool) -> Option<Vec<&str>> {
     quote.is_none().then_some(parts)
 }
 
+fn is_win_path_next(b: Option<&u8>) -> bool {
+    b.is_some_and(|n| !n.is_ascii() || n.is_ascii_alphanumeric() || b"._-*".contains(n))
+}
+
 /// Whether `s` has a backslash that may escape something. With `win`, one before
 /// a path character (`crates\foo`, `.\x`, `sub\*.rs`) is a separator instead.
 fn escapes(s: &str, win: bool) -> bool {
     let b = s.as_bytes();
-    (0..b.len()).any(|i| {
-        b[i] == b'\\' && !(win && b.get(i + 1).is_some_and(|n| n.is_ascii_alphanumeric() || b"._-*".contains(n)))
-    })
+    (0..b.len()).any(|i| b[i] == b'\\' && !(win && is_win_path_next(b.get(i + 1))))
 }
 
 /// Single-quote `s` for a POSIX shell.
@@ -361,7 +363,7 @@ fn rewrite(command: &str, exe: &str) -> Option<String> {
 /// Claude Code `PreToolUse` response rewriting a Bash call, or `None` to leave
 /// it alone (any unexpected shape included). Never sets `permissionDecision`.
 fn pre_bash(payload: &str, exe: &str) -> Option<Value> {
-    let p: Value = serde_json::from_str(payload).ok()?;
+    let p: Value = serde_json::from_str(payload.trim_start_matches('\u{feff}')).ok()?;
     if p["tool_name"] != "Bash" {
         return None;
     }
@@ -489,24 +491,79 @@ fn shell(command: &str) -> Command {
     cmd
 }
 
-/// Git for Windows' `sh.exe` when there is one (commands are usually written
-/// for it), else `cmd.exe /D /S /C "command"`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn needs_sh(command: &str) -> bool {
+    const POSIX_CMD: &[&str] = &[
+        "true", "false", "sleep", "test", "[", "seq", "export", "source", ".", "unset", "if", "for", "while",
+        "until", "case", "sh", "bash", "env", "printf", "touch", "rm", "cp", "mv", "ls", "cat", "head", "tail",
+        "grep", "sed", "awk", "wc", "which", "pwd",
+    ];
+    let b = command.as_bytes();
+    let (mut segs, mut start, mut in_dq, mut i) = (Vec::new(), 0, false, 0);
+    while i < b.len() {
+        let c = b[i];
+        if c == b'"' {
+            in_dq = !in_dq;
+        } else if !in_dq {
+            match c {
+                b'\'' | b';' | b'$' | b'`' | b'{' | b'}' | b'\n' => return true,
+                b'\\' if !is_win_path_next(b.get(i + 1)) => return true,
+                b'/' if command[i..].starts_with("/dev/null") => return true,
+                b'|' | b'&' => {
+                    segs.push(&command[start..i]);
+                    if b.get(i + 1) == Some(&c) {
+                        i += 1;
+                    }
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    segs.push(&command[start..]);
+    segs.into_iter().any(|seg| {
+        seg.split_whitespace().next().is_some_and(|first| {
+            is_env_assign(first) || (!first.starts_with('"') && first.contains('/')) || POSIX_CMD.contains(&first)
+        })
+    })
+}
+
 #[cfg(windows)]
-fn shell(command: &str) -> Command {
-    use std::os::windows::process::CommandExt;
+fn find_sh() -> Option<&'static std::path::PathBuf> {
     use std::path::PathBuf;
     static SH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-    let sh = SH.get_or_init(|| {
+    SH.get_or_init(|| {
         let on_path = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).map(|d| d.join("sh.exe")).collect::<Vec<_>>());
         let git = std::env::var_os("ProgramFiles").map(|p| {
             let git = PathBuf::from(p).join("Git");
-            vec![git.join(r"usr\bin\sh.exe"), git.join(r"bin\sh.exe")]
+            vec![git.join(r"bin\sh.exe"), git.join(r"usr\bin\sh.exe")]
         });
         on_path.into_iter().chain(git).flatten().find(|p| p.is_file())
-    });
-    if let Some(sh) = sh {
+    })
+    .as_ref()
+}
+
+/// Windows runs plain commands directly via `cmd.exe` so `\` paths and NTSTATUS exit
+/// codes stay intact; commands using POSIX syntax or utilities use `sh.exe` if installed.
+#[cfg(windows)]
+fn shell(command: &str) -> Command {
+    use std::os::windows::process::CommandExt;
+    if needs_sh(command)
+        && let Some(sh) = find_sh()
+    {
         let mut cmd = Command::new(sh);
         cmd.arg("-c").arg(command);
+        if let Some(dir) = sh.parent() {
+            let cur = std::env::var_os("PATH").unwrap_or_default();
+            let mut paths: Vec<_> = std::env::split_paths(&cur).collect();
+            if !paths.iter().any(|p| cwd::key(p) == cwd::key(dir)) {
+                paths.push(dir.to_path_buf());
+                if let Ok(joined) = std::env::join_paths(paths) {
+                    cmd.env("PATH", joined);
+                }
+            }
+        }
         return cmd;
     }
     let mut cmd = Command::new(std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into()));
@@ -654,17 +711,18 @@ fn words(s: &str) -> Vec<(usize, &str)> {
     out
 }
 
+fn is_env_assign(w: &str) -> bool {
+    w.split_once('=').is_some_and(|(k, _)| !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+}
+
 /// Index of the real program word, past `VAR=value`, `env` and runner wrappers.
 fn program(w: &[(usize, &str)]) -> usize {
     let word = |i: usize| w.get(i).map_or("", |x| x.1);
     let mut i = 0;
     loop {
         let cur = word(i);
-        let assign = cur.split_once('=').is_some_and(|(k, _)| {
-            !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        });
         i += match (cur, word(i + 1)) {
-            _ if assign => 1,
+            _ if is_env_assign(cur) => 1,
             ("env" | "npx" | "bunx" | "pnpx" | "yarn", _) => 1,
             ("pnpm" | "bun", "exec" | "dlx" | "x") | ("uv" | "poetry" | "pipenv" | "hatch", "run") => 2,
             (p, "-m") if p.starts_with("python") => 2,
@@ -1549,7 +1607,7 @@ error: test failed, to rerun pass `--bin demo`"##;
 
     #[test]
     fn backslash_is_a_path_separator_only_on_windows() {
-        for s in [r"cd crates\foo", r"cargo check --manifest-path sub\Cargo.toml", r".\x", r"a\_b\-c\*.rs"] {
+        for s in [r"cd crates\foo", r"cargo check --manifest-path sub\Cargo.toml", r".\x", r"a\_b\-c\*.rs", r"cargo check --manifest-path .\папка\Cargo.toml", r"cd .\日本語\proj"] {
             assert!(escapes(s, false) && !escapes(s, true), "{s}");
         }
         for s in [r#"echo \"x\""#, r"a \&& b", r"trailing\", "a\\\nb", r"a\ b", r"a\$b"] {
@@ -1576,6 +1634,41 @@ error: test failed, to rerun pass `--bin demo`"##;
         }
     }
 
+    #[test]
+    fn needs_sh_routes_only_posix_commands() {
+        for c in [
+            "cargo check --all-targets",
+            r"cargo check --manifest-path .\Cargo.toml",
+            r"cargo check --manifest-path .\папка\Cargo.toml",
+            r"cd .\日本語\proj",
+            "cargo check --manifest-path ./Cargo.toml",
+            r#"powershell -NoProfile -Command "exit -1073741819""#,
+            r#"python -c "import sys; sys.exit(1)""#,
+            "exit -1073741502",
+            r#""C:\Program Files\Git\cmd\git.exe" --version"#,
+            "ping -n 30 127.0.0.1",
+            "set FOO=1 && echo %FOO%",
+            "cargo test | findstr FAIL",
+        ] {
+            assert!(!needs_sh(c), "unexpected sh route: {c}");
+        }
+        for c in [
+            "echo 'hello'",
+            r"cargo check --manifest-path '.\Cargo.toml'",
+            "RUST_BACKTRACE=1 cargo test",
+            "sleep 1",
+            "seq 1 5; exit 2",
+            "cargo test | head -n 5",
+            "./scripts/test.sh",
+            "echo $HOME",
+            "echo ok >/dev/null",
+            "export FOO=1 && echo $FOO",
+        ] {
+            assert!(needs_sh(c), "expected sh route: {c}");
+        }
+        assert!(pre_bash("\u{feff}\u{feff}{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"cargo check\"}}", "agyfast-rs").is_some());
+    }
+
     // Works whether the shell found is Git's sh.exe or cmd.exe.
     #[cfg(windows)]
     #[test]
@@ -1585,6 +1678,13 @@ error: test failed, to rerun pass `--bin demo`"##;
         assert_eq!(r.status, Status::Pass);
         assert!(r.out.contains("hello"), "{}", r.out);
         assert_eq!(execute("exit 3", dir.path(), 10).status, Status::Fail("exit 3".into()));
+        assert_eq!(execute("exit -1073741819", dir.path(), 10).status, Status::Fail("exit 0xC0000005 - access violation".into()));
+        assert_eq!(execute("exit -1073741502", dir.path(), 10).status, Status::Fail("exit 0xC0000142 - DLL init failed".into()));
+        assert!(execute(r"echo .\Cargo.toml", dir.path(), 10).out.contains(r".\Cargo.toml"));
+        if find_sh().is_some() {
+            assert_eq!(execute("sleep 0", dir.path(), 10).status, Status::Pass);
+            assert_eq!(execute("echo 'a b'", dir.path(), 10).out.trim(), "a b");
+        }
         let r = execute("ping -n 30 127.0.0.1", dir.path(), 1);
         assert_eq!(r.status, Status::Timeout);
         assert!(r.ms < 10_000, "took {}ms", r.ms);

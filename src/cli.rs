@@ -42,6 +42,7 @@ fn worker_brief() -> Result<String, String> {
 }
 
 fn object(text: &str) -> Result<Map<String, Value>, String> {
+    let text = text.trim_start_matches('\u{feff}');
     match serde_json::from_str(text) {
         Ok(Value::Object(m)) => Ok(m),
         Ok(_) => Err("Error: expected a JSON object of tool arguments".into()),
@@ -222,6 +223,9 @@ mod tests {
             build("apply_edits", &args(&["--json", r#"{"edits":[]}"#, "--best-effort"])).unwrap(),
             json!({"edits": [], "bestEffort": true})
         );
+        assert_eq!(object("\u{feff}{\"edits\":[]}").unwrap().get("edits"), Some(&json!([])));
+        assert_eq!(object("\u{feff}\u{feff}{\"edits\":[]}").unwrap().get("edits"), Some(&json!([])));
+        assert_eq!(build("apply_edits", &args(&["--json", "\u{feff}{\"edits\":[]}"])).unwrap(), json!({"edits": []}));
         assert!(build("run_checks", &args(&["--bogus"])).is_err());
         assert!(build("run_checks", &args(&["--timeout", "soon"])).is_err());
     }
