@@ -3,8 +3,8 @@
 version = 4
 
 [[package]]
-name = "agy-rs"
-version = "0.1.0"
+name = "agyfast-rs"
+version = "0.1.1"
 dependencies = [
  "globset",
  "grep-matcher",

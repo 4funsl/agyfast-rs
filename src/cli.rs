@@ -1,4 +1,4 @@
-//! `agy-rs cli <tool> ...`: the same five tools without an MCP server, for
+//! `agyfast-rs cli <tool> ...`: the same five tools without an MCP server, for
 //! swarm workers and plain shells. Flags are translated to the MCP argument
 //! JSON and go through the same dispatch.
 
@@ -6,7 +6,7 @@ use crate::{core, tools};
 use serde_json::{Map, Value, json};
 use std::io::Read;
 
-const HELP: &str = r#"agy-rs cli <tool> [--cwd DIR] [--max-chars N] [--json '{...}' | --stdin] ...
+const HELP: &str = r#"agyfast-rs cli <tool> [--cwd DIR] [--max-chars N] [--json '{...}' | --stdin] ...
   search   [modifiers] --text|--regex|--glob|--fuzzy|--git PATTERN  (repeatable; modifiers apply to the next query)
            modifiers: --path P --glob-filter G --file-type T --output-mode content|files_with_matches|count
                       --sort-by path|mtime --context N --max-results N --ignore-case --multiline --definition
@@ -14,14 +14,14 @@ const HELP: &str = r#"agy-rs cli <tool> [--cwd DIR] [--max-chars N] [--json '{..
   slices   [--outline FILE]... FILE:START-END[,START-END]...
   edit     [--best-effort] [--dry-run] [--verify CMD] [--verify-timeout S] [--max-verify-chars N] --stdin   ({"edits":[...]} on stdin)
   check    [--compact|--full] [--concurrency N] [--timeout S] "CMD"...
-  filter   "CMD"   compress CMD's output read from stdin (runs nothing); first line [agy-rs PASS|FAIL],
-                   exit 1 when the output shows failure (used by `agy-rs hook pre-bash`)
+  filter   "CMD"   compress CMD's output read from stdin (runs nothing); first line [agyfast-rs PASS|FAIL],
+                   exit 1 when the output shows failure (used by `agyfast-rs hook pre-bash`)
   snapshot
   worker-brief   print the /swarm worker brief with this binary's path filled in; set --cwd <WORKSPACE> before pasting
 --json / --stdin take the tool's full MCP argument object; flags given after them override it."#;
 
 /// The `/swarm` worker brief; `<AGY>` becomes the running binary's quoted path.
-const WORKER_BRIEF: &str = r#"Navigate with ranged read_file (<=200 lines per call, parallel) plus the agy-rs CLI; reads are the largest cost, so add --definition to queries whose hits you will read or edit: each hit comes back with its whole definition, and you edit from those lines. Put per-query modifiers before their query:
+const WORKER_BRIEF: &str = r#"Navigate with ranged read_file (<=200 lines per call, parallel) plus the agyfast-rs CLI; reads are the largest cost, so add --definition to queries whose hits you will read or edit: each hit comes back with its whole definition, and you edit from those lines. Put per-query modifiers before their query:
   <AGY> cli search --cwd <WORKSPACE> --path src --definition --text "foo" --git "status --short"
   <AGY> cli outline --cwd <WORKSPACE> a.rs b.ts#Name,other   (file#Name prints those definitions' source)
   <AGY> cli slices --cwd <WORKSPACE> b.rs:10-60,90-120

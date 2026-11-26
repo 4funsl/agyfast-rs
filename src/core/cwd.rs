@@ -44,7 +44,7 @@ mod tests {
         assert!(resolve(Some("/definitely/not/here")).is_err());
         let tmp = std::env::temp_dir();
         assert_eq!(resolve(tmp.to_str()).unwrap(), tmp.canonicalize().unwrap());
-        let root = tmp.join("agy-rs-cwd-test-plugin-root");
+        let root = tmp.join("agyfast-rs-cwd-test-plugin-root");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("plugin.json"), "{}").unwrap();
         std::fs::write(root.join("mcp_config.json"), "{}").unwrap();

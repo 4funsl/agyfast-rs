@@ -5,7 +5,7 @@
       "args": [
         "-c",
         "exec \"$0\" mcp",
-        "${PLUGIN_ROOT}/bin/agy-rs"
+        "${PLUGIN_ROOT}/bin/agyfast-rs"
       ],
       "tools": {
         "batch_search": {

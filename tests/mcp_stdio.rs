@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 
 #[test]
 fn mcp_session_over_stdio() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_agy-rs"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agyfast-rs"))
         .arg("mcp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate assets/compare.svg: plain Antigravity vs agy-fast vs agy-rs. Standard library only.
+"""Generate assets/compare.svg: plain Antigravity vs agy-fast vs agyfast-rs. Standard library only.
 
 Numbers: hard benchmark, solo agent, Gemini 4 Hydrogen Low, one run each, all 14/15
 (docs/BENCHMARKS.md). Run: python3 assets/make-compare.py
@@ -8,7 +8,7 @@ from pathlib import Path
 
 W, H = 1200, 520
 BG, PANEL, TEXT, DIM = "#0F172A", "#111C33", "#E2E8F0", "#64748B"
-ROWS = [("No plugin", "#64748B"), ("agy-fast 0.3.1", "#38BDF8"), ("agy-rs", "#34D399")]
+ROWS = [("No plugin", "#64748B"), ("agy-fast 0.3.1", "#38BDF8"), ("agyfast-rs", "#34D399")]
 # title, unit note, values per row (None = not applicable), value labels
 PANELS = [
     ("Billable tokens (weighted)", "lower is better", [273176, 238088, 206669], ["273k", "238k  −13%", "207k  −24%"]),
@@ -29,13 +29,13 @@ def main():
         peak = max(v for v in vals if v)
         for i, ((name, color), v, label) in enumerate(zip(ROWS, vals, labels)):
             by = y + 58 + i * 42
-            bold = ' font-weight="700"' if name == "agy-rs" else ""
+            bold = ' font-weight="700"' if name == "agyfast-rs" else ""
             out.append(f'<text x="{x + 20}" y="{by + 17}" fill="{color}" font-size="14"{bold}>{name}</text>')
             bw = 250 * v / peak if v else 0
             if bw:
                 out.append(f'<rect x="{x + 160}" y="{by}" width="{bw:.0f}" height="24" rx="4" fill="{color}"/>')
             out.append(f'<text x="{x + 170 + bw:.0f}" y="{by + 17}" fill="{TEXT}" font-size="14"{bold}>{label}</text>')
-    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" role="img" aria-label="Same task in plain Antigravity, with agy-fast and with agy-rs: weighted tokens 273k, 238k, 207k; LLM turns 25, 20, 16; wall time 184, 151, 146 seconds; tokens added per session none, about 4,800, about 2,700">
+    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" role="img" aria-label="Same task in plain Antigravity, with agy-fast and with agyfast-rs: weighted tokens 273k, 238k, 207k; LLM turns 25, 20, 16; wall time 184, 151, 146 seconds; tokens added per session none, about 4,800, about 2,700">
 <rect width="{W}" height="{H}" fill="{BG}"/>
 <text x="30" y="40" fill="{TEXT}" font-size="20" font-weight="700">Same task, same model, same score (14/15)</text>
 <text x="30" y="62" fill="{DIM}" font-size="13">hard benchmark · solo agent · Gemini 4 Hydrogen Low · one run per configuration · docs/BENCHMARKS.md</text>

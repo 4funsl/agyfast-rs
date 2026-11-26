@@ -1,6 +1,6 @@
-# agy-rs Tool Routing Rules
+# agyfast-rs Tool Routing Rules
 
-`agy-rs_rs` MCP tools batch work behind one remote check (~1.8s) and compress output; built-in `read_file` stays for reads (local, ~7ms, 46 KB/call vs MCP's 8.8 KB cap).
+`agyfast-rs_rs` MCP tools batch work behind one remote check (~1.8s) and compress output; built-in `read_file` stays for reads (local, ~7ms, 46 KB/call vs MCP's 8.8 KB cap).
 
 | Task | Tool |
 | :--- | :--- |
@@ -13,10 +13,10 @@
 
 ## Rules
 
-1. Call `mcp_agy-rs_rs_*` directly (eager); don't read `mcp/agy-rs_rs/*.json`. Always pass absolute `cwd` and a short `toolSummary`.
+1. Call `mcp_agyfast-rs_rs_*` directly (eager); don't read `mcp/agyfast-rs_rs/*.json`. Always pass absolute `cwd` and a short `toolSummary`.
 2. After edits put the whole check chain in `apply_edits.verify`, e.g. `cargo check --all-targets && cargo test` (`&&` steps run in order, each compressed), and don't rerun those commands. Plain commands like `git checkout` stay on `run_command`.
-3. One call per agy-rs tool per turn, never two in parallel. If `apply_edits` reports corrupted nested arguments (empty `edits`, booleans in `edits`), don't retry; use built-in `edit_file`/`write_file`.
+3. One call per agyfast-rs tool per turn, never two in parallel. If `apply_edits` reports corrupted nested arguments (empty `edits`, booleans in `edits`), don't retry; use built-in `edit_file`/`write_file`.
 4. Read the `SessionStart` snapshot before `ls`/`git status`; `git diff --stat` before full diffs; never blind-read `1-800`.
 5. Reads are the largest cost: give `batch_search` queries whose hits you will read or edit `definition: true` (each hit returns its whole definition) and edit straight from those lines; `read_file` only what that does not show.
 6. Keep checks under ~45s; defer >60s builds to phase end. For <=10s `run_command` set `WaitMsBeforeAsync` 5000-10000 instead of backgrounding.
-7. `/swarm` workers get no MCP, rules or `SessionStart`: run `"$HOME/.gemini/config/plugins/agy-rs/bin/agy-rs" cli worker-brief` and paste its output into each worker prompt, filling in `--cwd <WORKSPACE>`. Give every file exactly one owner: a file several workers must change goes to one worker, or to the coordinator after the workers finish.
+7. `/swarm` workers get no MCP, rules or `SessionStart`: run `"$HOME/.gemini/config/plugins/agyfast-rs/bin/agyfast-rs" cli worker-brief` and paste its output into each worker prompt, filling in `--cwd <WORKSPACE>`. Give every file exactly one owner: a file several workers must change goes to one worker, or to the coordinator after the workers finish.

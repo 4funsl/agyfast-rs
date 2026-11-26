@@ -14,7 +14,7 @@ fn handle(msg: &Value) -> Option<Value> {
         "initialize" => Ok(json!({
             "protocolVersion": params["protocolVersion"].as_str().unwrap_or("2024-11-05"),
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "agy-rs", "version": env!("CARGO_PKG_VERSION")},
+            "serverInfo": {"name": "agyfast-rs", "version": env!("CARGO_PKG_VERSION")},
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": schema::tools()})),

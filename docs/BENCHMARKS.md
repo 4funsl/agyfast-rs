@@ -1,6 +1,6 @@
 # Benchmarks
 
-How `agy-rs` is measured, and the current results. Every number here comes from a headless
+How `agyfast-rs` is measured, and the current results. Every number here comes from a headless
 Antigravity CLI run that we scored and counted ourselves; nothing is estimated.
 
 ## Method
@@ -51,7 +51,7 @@ effective maximum is 14.
 
 ### Solo agent, hard task, Gemini 4 Hydrogen Low
 
-| | No plugin | agy-fast 0.3.1 | agy-rs |
+| | No plugin | agy-fast 0.3.1 | agyfast-rs |
 | :--- | ---: | ---: | ---: |
 | Score | 14/15 | 14/15 | 14/15 |
 | Wall time | 184 s | 151 s | 146 s |
@@ -70,7 +70,7 @@ which is what you would expect when the same code gets written.
 
 ### Solo agent, hard task, Gemini 4 Hydrogen Medium
 
-| | No plugin | agy-rs (earlier build) |
+| | No plugin | agyfast-rs (earlier build) |
 | :--- | ---: | ---: |
 | Score | 14/15 | 14/15 |
 | Wall time | 210 s | 193 s |
@@ -83,7 +83,7 @@ Low reached the same score as Medium for 25–30% less cost on this task.
 
 ### Solo and swarm, long task, Gemini 4 Hydrogen Low
 
-| | Solo, agy-rs | 3-worker swarm, agy-rs | 3-worker swarm, no plugin |
+| | Solo, agyfast-rs | 3-worker swarm, agyfast-rs | 3-worker swarm, no plugin |
 | :--- | ---: | ---: | ---: |
 | Score | 36/36 | 36/36 | 36/36 |
 | Wall time | 259 s | 212 s | 280 s |
@@ -93,12 +93,12 @@ Low reached the same score as Medium for 25–30% less cost on this task.
 | Time vs solo | — | −18% | +8% |
 | Cost vs solo | — | +36% | +50% |
 
-In the swarm with `agy-rs`, workers were active for 115 s of 212 s. They ran all 13 of their build
-and test commands through `agy-rs cli check`; without the plugin they ran `cargo` directly.
+In the swarm with `agyfast-rs`, workers were active for 115 s of 212 s. They ran all 13 of their build
+and test commands through `agyfast-rs cli check`; without the plugin they ran `cargo` directly.
 
 ### Swarm, hard task, Gemini 4 Hydrogen Medium
 
-| | Solo, agy-rs | 3-worker swarm, agy-rs | 3-worker swarm, agy-fast | 3-worker swarm, no plugin |
+| | Solo, agyfast-rs | 3-worker swarm, agyfast-rs | 3-worker swarm, agy-fast | 3-worker swarm, no plugin |
 | :--- | ---: | ---: | ---: | ---: |
 | Score | 14/15 | 14/15 | 14/15 | 14/15 |
 | Wall time | 193 s | 217 s | 215 s | 216 s |
@@ -109,12 +109,12 @@ run; the rest was the coordinator reading before the split and integrating after
 
 ## What the results say
 
-1. **Solo:** `agy-rs` reduced turns by 5–9 and cost by 15–24% against the plain host at equal
+1. **Solo:** `agyfast-rs` reduced turns by 5–9 and cost by 15–24% against the plain host at equal
    score, on two effort levels.
 2. **Against agy-fast:** 4 fewer turns and 13% less cost in the one head-to-head run; that gap is
    about the size of the noise. The clearer differences are structural: less fixed context and
    build output that always goes through the compressor.
-3. **Swarm, independent parts:** with `agy-rs` the swarm was faster than one agent (−18% time) for
+3. **Swarm, independent parts:** with `agyfast-rs` the swarm was faster than one agent (−18% time) for
    more tokens (+36%). Without it the swarm was slower than one agent.
 4. **Swarm, coupled parts:** about twice the cost of one agent and no faster, with any plugin.
 

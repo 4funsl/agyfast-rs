@@ -31,22 +31,22 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          name="agy-rs-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          name="agyfast-rs-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$name"
           cp -R plugin install.sh install.ps1 LICENSE README.md "$name/"
           if [[ "${{ matrix.target }}" == *windows* ]]; then
-            cp "target/${{ matrix.target }}/release/agy-rs.exe" "$name/"
+            cp "target/${{ matrix.target }}/release/agyfast-rs.exe" "$name/"
             7z a "$name.zip" "$name" > /dev/null
           else
-            cp "target/${{ matrix.target }}/release/agy-rs" "$name/"
+            cp "target/${{ matrix.target }}/release/agyfast-rs" "$name/"
             tar -czf "$name.tar.gz" "$name"
           fi
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
           path: |
-            agy-rs-*.tar.gz
-            agy-rs-*.zip
+            agyfast-rs-*.tar.gz
+            agyfast-rs-*.zip
           if-no-files-found: error
 
   release:
@@ -60,5 +60,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          sha256sum agy-rs-* > SHA256SUMS
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "agy-rs $GITHUB_REF_NAME" --generate-notes agy-rs-* SHA256SUMS
+          sha256sum agyfast-rs-* > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "agyfast-rs $GITHUB_REF_NAME" --generate-notes agyfast-rs-* SHA256SUMS

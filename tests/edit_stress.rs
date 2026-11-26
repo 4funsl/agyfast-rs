@@ -1,4 +1,4 @@
-//! Many concurrent `agy-rs cli edit` processes against one file: no edit may be
+//! Many concurrent `agyfast-rs cli edit` processes against one file: no edit may be
 //! lost and no line corrupted. Fails without the per-file lock or atomic write.
 
 use std::io::Write;
@@ -32,7 +32,7 @@ fn concurrent_cli_edits_lose_nothing() {
     // Spawn everyone first; they block on stdin, so feeding it afterwards starts them together.
     let mut children: Vec<_> = (0..WORKERS)
         .map(|_| {
-            Command::new(env!("CARGO_BIN_EXE_agy-rs"))
+            Command::new(env!("CARGO_BIN_EXE_agyfast-rs"))
                 .args(["cli", "edit", "--cwd", dir.path().to_str().unwrap(), "--stdin"])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())

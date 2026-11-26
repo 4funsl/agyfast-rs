@@ -25,7 +25,7 @@ pub fn acquire(path: &Path) -> io::Result<File> {
         .as_encoded_bytes()
         .iter()
         .fold(0xcbf29ce484222325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3));
-    let dir = std::env::temp_dir().join("agy-rs-locks");
+    let dir = std::env::temp_dir().join("agyfast-rs-locks");
     std::fs::create_dir_all(&dir)?;
     let file = File::options()
         .create(true)
@@ -42,7 +42,7 @@ mod tests {
 
     #[test]
     fn same_path_contends_and_new_files_work() {
-        let target = std::env::temp_dir().join("agy-rs-lock-test-does-not-exist.txt");
+        let target = std::env::temp_dir().join("agyfast-rs-lock-test-does-not-exist.txt");
         let held = acquire(&target).unwrap();
         let t = target.clone();
         let waiter = std::thread::spawn(move || acquire(&t).map(|_| std::time::Instant::now()));

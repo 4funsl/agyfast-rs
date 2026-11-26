@@ -199,7 +199,7 @@ fn response(payload: &Value, text: &str) -> Value {
     }
 }
 
-/// `agy-rs hook session-start`: read the host payload on stdin, print the hook response.
+/// `agyfast-rs hook session-start`: read the host payload on stdin, print the hook response.
 pub fn hook() {
     let out = read_payload()
         .and_then(|p| {

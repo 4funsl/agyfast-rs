@@ -1,9 +1,9 @@
 {
-  "agy-rs-snapshot": {
+  "agyfast-rs-snapshot": {
     "SessionStart": [
       {
         "type": "command",
-        "command": "if [ -x ./bin/agy-rs ]; then exec ./bin/agy-rs hook session-start; else printf '{}'; fi",
+        "command": "if [ -x ./bin/agyfast-rs ]; then exec ./bin/agyfast-rs hook session-start; else printf '{}'; fi",
         "timeout": 5
       }
     ]

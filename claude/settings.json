@@ -1,10 +1,10 @@
 {
   "hooks": {
     "SessionStart": [
-      { "hooks": [{ "type": "command", "command": "agy-rs hook session-start", "timeout": 5 }] }
+      { "hooks": [{ "type": "command", "command": "agyfast-rs hook session-start", "timeout": 5 }] }
     ],
     "PreToolUse": [
-      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "agy-rs hook pre-bash", "timeout": 5 }] }
+      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "agyfast-rs hook pre-bash", "timeout": 5 }] }
     ]
   }
 }

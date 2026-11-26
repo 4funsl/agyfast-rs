@@ -3,7 +3,7 @@ mod core;
 mod mcp;
 mod tools;
 
-const USAGE: &str = "agy-rs <mcp | hook session-start | hook pre-bash | cli <search|outline|slices|edit|check|filter|snapshot> ...>
+const USAGE: &str = "agyfast-rs <mcp | hook session-start | hook pre-bash | cli <search|outline|slices|edit|check|filter|snapshot> ...>
   mcp                  stdio MCP server (JSON-RPC on stdout, logs on stderr)
   hook session-start   print the workspace snapshot for a SessionStart hook
   hook pre-bash        Claude Code PreToolUse hook: pipe build/test/lint Bash commands through `cli filter`
@@ -23,7 +23,7 @@ fn main() {
         }
         ["cli", ..] => cli::run(&args[1..]),
         ["--version" | "-V"] => {
-            println!("agy-rs {}", env!("CARGO_PKG_VERSION"));
+            println!("agyfast-rs {}", env!("CARGO_PKG_VERSION"));
             0
         }
         ["--help" | "-h"] => {

@@ -1,6 +1,6 @@
 {
-  "name": "agy-rs",
-  "displayName": "agy-rs",
+  "name": "agyfast-rs",
+  "displayName": "agyfast-rs",
   "version": "0.1.0",
   "description": "Batched code search, outlines, atomic edits and compressed checks, plus a session snapshot, in one static binary.",
   "license": "MIT",

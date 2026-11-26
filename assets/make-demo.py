@@ -19,7 +19,7 @@ LEFT = dict(title="Antigravity, no plugin", secs=184, color=RED, stats="25 turns
     "read_file src/tools/check.rs", "edit_file src/tools/check.rs", "edit_file src/cli.rs",
     "cargo clippy (full output)", "edit_file src/mcp/schema.rs", "cargo test   (full output)",
     "… 51 tool calls in 25 turns"])
-RIGHT = dict(title="Antigravity + agy-rs", secs=146, color=ACCENT, stats="16 turns · 29 tool calls · 146 s · 207k tokens", lines=[
+RIGHT = dict(title="Antigravity + agyfast-rs", secs=146, color=ACCENT, stats="16 turns · 29 tool calls · 146 s · 207k tokens", lines=[
     "batch_search  4 queries, definition: true", "run_checks    cargo test → 3 failures, summary",
     "read_file     2 files", "apply_edits   5 files + verify: cargo test",
     "batch_search  fn fit, definition: true", "apply_edits   2 files + verify",
@@ -62,7 +62,7 @@ def main():
     panel(610, RIGHT, 1, css, out)
     css.append(f"@keyframes sum{{0%,{pct(RUN)}{{opacity:0}}{pct(RUN + 0.4)},98%{{opacity:1}}100%{{opacity:0}}}}"
                f".sum{{opacity:0;animation:sum {CYCLE}s linear infinite}}")
-    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" role="img" aria-label="Same coding task in Antigravity without and with agy-rs: 25 turns and 184 seconds become 16 turns and 146 seconds, with 24 percent fewer tokens">
+    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" role="img" aria-label="Same coding task in Antigravity without and with agyfast-rs: 25 turns and 184 seconds become 16 turns and 146 seconds, with 24 percent fewer tokens">
 <style>{"".join(css)}</style>
 <rect width="{W}" height="{H}" fill="{BG}"/>
 <text x="30" y="42" fill="{TEXT}" font-size="20" font-weight="700">One coding task, same result</text>

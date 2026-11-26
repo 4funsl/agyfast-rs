@@ -1,5 +1,5 @@
-# Build agy-rs on Windows.
-#   .\build.ps1          release build -> target\release\agy-rs.exe
+# Build agyfast-rs on Windows.
+#   .\build.ps1          release build -> target\release\agyfast-rs.exe
 #   .\build.ps1 -Check   also run the tests and clippy
 param([switch]$Check)
 $ErrorActionPreference = "Stop"
@@ -17,4 +17,4 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "cargo clippy failed" }
   }
 } finally { Pop-Location }
-Write-Host "Built: $(Join-Path $PSScriptRoot 'target\release\agy-rs.exe')"
+Write-Host "Built: $(Join-Path $PSScriptRoot 'target\release\agyfast-rs.exe')"

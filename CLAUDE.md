@@ -1,4 +1,4 @@
-# agy-rs
+# agyfast-rs
 
 One Rust binary with batched code-navigation tools for Antigravity and Claude Code. Design: `idea,md`. Behavioural reference (read-only, third-party): `reference/agy-fast/`.
 
