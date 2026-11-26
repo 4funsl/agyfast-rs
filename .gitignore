@@ -3,3 +3,4 @@ plugin/bin/
 # third-party behavioural reference, not ours to ship
 reference/
 dist/
+issue.md

@@ -198,7 +198,9 @@ fn body(r: &Run, full: bool, max: usize) -> String {
     };
     let text = if text.trim().is_empty() { "(no output)".to_string() } else { text };
     match r.status {
-        Status::Timeout => format!("TIMED OUT after {}s, process group killed\n{text}", r.timeout),
+        Status::Timeout => {
+            format!("TIMED OUT after {}s, process {} killed\n{text}", r.timeout, if cfg!(windows) { "tree" } else { "group" })
+        }
         _ => text,
     }
 }
@@ -265,11 +267,11 @@ fn and_parts(command: &str, allow_merge: bool) -> Option<Vec<&str>> {
     let b = command.as_bytes();
     let (mut parts, mut start, mut quote, mut i) = (Vec::new(), 0, None, 0);
     let mut merged = false; // set once the current part has had its trailing `2>&1`
+    if escapes(command, cfg!(windows)) {
+        return None;
+    }
     while i < b.len() {
         let c = b[i];
-        if c == b'\\' {
-            return None;
-        }
         if merged && quote.is_none() && !c.is_ascii_whitespace() && !command[i..].starts_with("&&") {
             return None; // something after the `2>&1` other than `&&`
         }
@@ -303,6 +305,15 @@ fn and_parts(command: &str, allow_merge: bool) -> Option<Vec<&str>> {
     }
     parts.push(command[start..].trim());
     quote.is_none().then_some(parts)
+}
+
+/// Whether `s` has a backslash that may escape something. With `win`, one before
+/// a path character (`crates\foo`, `.\x`, `sub\*.rs`) is a separator instead.
+fn escapes(s: &str, win: bool) -> bool {
+    let b = s.as_bytes();
+    (0..b.len()).any(|i| {
+        b[i] == b'\\' && !(win && b.get(i + 1).is_some_and(|n| n.is_ascii_alphanumeric() || b"._-*".contains(n)))
+    })
 }
 
 /// Single-quote `s` for a POSIX shell.
@@ -446,10 +457,8 @@ fn execute_chain(steps: &[Step], dir: &Path, timeout: u64) -> Run {
 fn spawn_and_wait(command: &str, dir: &Path, timeout: Duration) -> std::io::Result<(Status, String)> {
     // One temp file for stdout and stderr: interleaved, and no pipe can fill up and deadlock.
     let mut file = tempfile::tempfile()?;
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c")
-        .arg(command)
-        .current_dir(dir)
+    let mut cmd = shell(command);
+    cmd.current_dir(dir)
         .stdin(Stdio::null())
         .stdout(file.try_clone()?)
         .stderr(file.try_clone()?);
@@ -473,6 +482,39 @@ fn spawn_and_wait(command: &str, dir: &Path, timeout: Duration) -> std::io::Resu
     Ok((status, read_capped(&mut file)?))
 }
 
+#[cfg(not(windows))]
+fn shell(command: &str) -> Command {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(command);
+    cmd
+}
+
+/// Git for Windows' `sh.exe` when there is one (commands are usually written
+/// for it), else `cmd.exe /D /S /C "command"`.
+#[cfg(windows)]
+fn shell(command: &str) -> Command {
+    use std::os::windows::process::CommandExt;
+    use std::path::PathBuf;
+    static SH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    let sh = SH.get_or_init(|| {
+        let on_path = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).map(|d| d.join("sh.exe")).collect::<Vec<_>>());
+        let git = std::env::var_os("ProgramFiles").map(|p| {
+            let git = PathBuf::from(p).join("Git");
+            vec![git.join(r"usr\bin\sh.exe"), git.join(r"bin\sh.exe")]
+        });
+        on_path.into_iter().chain(git).flatten().find(|p| p.is_file())
+    });
+    if let Some(sh) = sh {
+        let mut cmd = Command::new(sh);
+        cmd.arg("-c").arg(command);
+        return cmd;
+    }
+    let mut cmd = Command::new(std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into()));
+    // raw_arg: `/S` strips exactly the outer quotes, so the user's own quotes reach cmd untouched.
+    cmd.args(["/D", "/S", "/C"]).raw_arg(format!("\"{command}\""));
+    cmd
+}
+
 #[cfg(unix)]
 fn kill_group(child: &mut Child) {
     // SAFETY: plain syscall; the child leads its own process group (process_group(0)).
@@ -481,6 +523,13 @@ fn kill_group(child: &mut Child) {
 
 #[cfg(not(unix))]
 fn kill_group(child: &mut Child) {
+    // shortcut: taskkill walks the live parent chain only, use a Job Object if orphaned grandchildren show up
+    let _ = Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &child.id().to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
     let _ = child.kill();
 }
 
@@ -500,9 +549,27 @@ fn exit_status(s: ExitStatus) -> Status {
         Some(137) => Status::Fail("exit 137 / SIGKILL - possible OOM".into()),
         Some(139) => Status::Fail("exit 139 / SIGSEGV - segmentation fault".into()),
         Some(134) => Status::Fail("exit 134 / SIGABRT - process aborted".into()),
-        Some(c) => Status::Fail(format!("exit {c}")),
+        Some(c) => Status::Fail(ntstatus(c).unwrap_or_else(|| format!("exit {c}"))),
         None => Status::Fail("exit ?".into()),
     }
+}
+
+/// `exit 0xC0000005 - access violation` for a Windows crash (NTSTATUS error) code.
+fn ntstatus(code: i32) -> Option<String> {
+    let n = code as u32;
+    if n >> 28 != 0xC {
+        return None; // a script's `exit -1` is not a crash
+    }
+    let name = match n {
+        0xC000_0005 => " - access violation",
+        0xC000_00FD => " - stack overflow",
+        0xC000_0409 => " - stack buffer overrun",
+        0xC000_0135 => " - DLL not found",
+        0xC000_0142 => " - DLL init failed",
+        0xC000_013A => " - interrupted (Ctrl+C)",
+        _ => "",
+    };
+    Some(format!("exit {n:#010X}{name}"))
 }
 
 fn read_capped(f: &mut File) -> std::io::Result<String> {
@@ -607,8 +674,11 @@ fn program(w: &[(usize, &str)]) -> usize {
     }
 }
 
+/// Program name of a path word: `"C:\x\cargo.exe"` and `.\bin\eslint.cmd` give `cargo` and `eslint`.
 fn basename(word: &str) -> &str {
-    word.rsplit('/').next().unwrap_or(word)
+    let w = word.trim_matches(['\'', '"']);
+    let w = w.rsplit(['/', '\\']).next().unwrap_or(w);
+    w.rsplit_once('.').filter(|(_, e)| ["exe", "cmd", "bat"].iter().any(|x| e.eq_ignore_ascii_case(x))).map_or(w, |(s, _)| s)
 }
 
 /// Index of the cargo subcommand word when `w[i]` is `cargo`.
@@ -640,7 +710,7 @@ fn kind(command: &str) -> Kind {
 /// `cargo check|clippy|build ...` with `--message-format=json` right after the
 /// subcommand (so before any `--`), only for a single plain invocation.
 fn inject_json(command: &str) -> Option<String> {
-    if command.contains(|c| "|&;<>`$(){}\n\\".contains(c)) || command.contains("--message-format") {
+    if command.contains(|c| "|&;<>`$(){}\n".contains(c)) || escapes(command, cfg!(windows)) || command.contains("--message-format") {
         return None;
     }
     let w = words(command);
@@ -1130,6 +1200,7 @@ error: test failed, to rerun pass `--bin demo`"##;
         assert!(out.contains("line 141") && !out.contains("line 140\n"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn timeout_kills_the_whole_process_group() {
         let dir = tmp();
@@ -1146,6 +1217,7 @@ error: test failed, to rerun pass `--bin demo`"##;
         assert!(gone, "grandchild {pid} survived the timeout");
     }
 
+    #[cfg(unix)]
     #[test]
     fn large_output_does_not_deadlock() {
         let r = execute("seq 1 300000; seq 1 300000 >&2", tmp().path(), 30);
@@ -1154,6 +1226,7 @@ error: test failed, to rerun pass `--bin demo`"##;
         assert!(generic(&r.out).ends_with("299999\n300000"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_reports_in_order_within_a_multibyte_budget() {
         let dir = tmp();
@@ -1232,6 +1305,7 @@ error: test failed, to rerun pass `--bin demo`"##;
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn chain_stops_at_first_failure_and_names_the_rest() {
         let dir = tmp();
@@ -1267,6 +1341,7 @@ error: test failed, to rerun pass `--bin demo`"##;
         assert_eq!(summary(one), one);
     }
 
+    #[cfg(unix)] // rustc prints `src\lib.rs` on Windows
     #[test]
     fn real_cargo_chain_passes_then_fails_on_a_type_error() {
         let dir = tmp();
@@ -1290,6 +1365,7 @@ error: test failed, to rerun pass `--bin demo`"##;
         assert!(v.ends_with("Not run: `cargo test`"), "{v}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn verify_chain_stays_within_budget() {
         let dir = tmp();
@@ -1346,6 +1422,7 @@ error: test failed, to rerun pass `--bin demo`"##;
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn hook_quotes_the_original_command_for_the_shell() {
         let out = rewritten(r#"cargo test "it's" -- --exact"#).unwrap();
@@ -1418,6 +1495,7 @@ error: test failed, to rerun pass `--bin demo`"##;
         assert!(filter("cargo test", &"x".repeat(50_000)).0.len() <= budget::CAP);
     }
 
+    #[cfg(unix)] // rustc prints `src\lib.rs` on Windows
     #[test]
     fn filter_judges_real_cargo_output() {
         let dir = tmp();
@@ -1439,6 +1517,7 @@ error: test failed, to rerun pass `--bin demo`"##;
         assert!(failed && out.contains("src/lib.rs:1:42 [E0308] mismatched types") && out.ends_with("1 error, 0 warnings"), "{out}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn verify_reports_status_within_budget() {
         let dir = tmp();
@@ -1447,5 +1526,68 @@ error: test failed, to rerun pass `--bin demo`"##;
         let v = verify("seq 1 5000; exit 2", dir.path(), 5, 400);
         assert!(v.starts_with("Verify [FAIL (exit 2) in ") && v.len() <= 400 && v.ends_with("5000"), "{v}");
         assert!(verify("sleep 5", dir.path(), 1, 300).starts_with("Verify [TIMEOUT in "));
+    }
+
+    #[test]
+    fn basename_strips_dirs_quotes_and_windows_suffixes() {
+        for (w, b) in [
+            ("cargo", "cargo"),
+            ("/usr/bin/cargo", "cargo"),
+            ("cargo.exe", "cargo"),
+            (r"C:\x\CARGO.EXE", "CARGO"),
+            (r#""C:\Program Files\x\cargo.exe""#, "cargo"),
+            (r".\node_modules\.bin\eslint.cmd", "eslint"),
+            ("tsc.Bat", "tsc"),
+            ("py.test", "py.test"),
+        ] {
+            assert_eq!(basename(w), b, "{w}");
+        }
+        assert_eq!(kind("cargo.exe check"), Kind::Cargo);
+        assert_eq!(kind(r"C:\x\cargo.exe test"), Kind::Tests);
+        assert_eq!(kind(r".\node_modules\.bin\eslint.cmd src"), Kind::Lint);
+    }
+
+    #[test]
+    fn backslash_is_a_path_separator_only_on_windows() {
+        for s in [r"cd crates\foo", r"cargo check --manifest-path sub\Cargo.toml", r".\x", r"a\_b\-c\*.rs"] {
+            assert!(escapes(s, false) && !escapes(s, true), "{s}");
+        }
+        for s in [r#"echo \"x\""#, r"a \&& b", r"trailing\", "a\\\nb", r"a\ b", r"a\$b"] {
+            assert!(escapes(s, true), "{s}");
+        }
+        assert!(!escapes("cargo check", false));
+        let (cd, check) = (r"cd crates\foo && cargo test", r"cargo check --manifest-path sub\Cargo.toml");
+        if cfg!(windows) {
+            assert_eq!(split_chain(cd), Some(vec![Step::Cd(r"crates\foo"), Step::Run("cargo test")]));
+            assert_eq!(inject_json(check).as_deref(), Some(r"cargo check --message-format=json --manifest-path sub\Cargo.toml"));
+        } else {
+            assert_eq!((split_chain(cd), inject_json(check)), (None, None));
+        }
+    }
+
+    #[test]
+    fn windows_crash_codes_print_as_hex_with_a_name() {
+        assert_eq!(ntstatus(0xC000_0005_u32 as i32).as_deref(), Some("exit 0xC0000005 - access violation"));
+        assert_eq!(ntstatus(-1073741502).as_deref(), Some("exit 0xC0000142 - DLL init failed"));
+        assert_eq!(ntstatus(0xC000_013A_u32 as i32).as_deref(), Some("exit 0xC000013A - interrupted (Ctrl+C)"));
+        assert_eq!(ntstatus(0xC000_0001_u32 as i32).as_deref(), Some("exit 0xC0000001"));
+        for c in [0, 1, 101, 255, -1] {
+            assert_eq!(ntstatus(c), None, "{c}");
+        }
+    }
+
+    // Works whether the shell found is Git's sh.exe or cmd.exe.
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_passes_fails_and_times_out() {
+        let dir = tmp();
+        let r = execute("echo hello", dir.path(), 10);
+        assert_eq!(r.status, Status::Pass);
+        assert!(r.out.contains("hello"), "{}", r.out);
+        assert_eq!(execute("exit 3", dir.path(), 10).status, Status::Fail("exit 3".into()));
+        let r = execute("ping -n 30 127.0.0.1", dir.path(), 1);
+        assert_eq!(r.status, Status::Timeout);
+        assert!(r.ms < 10_000, "took {}ms", r.ms);
+        assert!(body(&r, false, budget::CAP).contains("TIMED OUT after 1s, process tree killed"));
     }
 }

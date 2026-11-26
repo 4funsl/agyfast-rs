@@ -60,9 +60,9 @@ struct Plan {
 
 /// Canonical path of a file that may not exist yet; symlinks resolve to their target.
 fn canonical(p: &Path) -> PathBuf {
-    p.canonicalize().unwrap_or_else(|_| {
+    p.canonicalize().map(cwd::simplify).unwrap_or_else(|_| {
         match (p.parent().and_then(|d| d.canonicalize().ok()), p.file_name()) {
-            (Some(dir), Some(name)) => dir.join(name),
+            (Some(dir), Some(name)) => cwd::simplify(dir).join(name),
             _ => std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()),
         }
     })
@@ -270,6 +270,7 @@ fn plan(job: &Job) -> Result<Plan, String> {
 fn write_atomic(path: &Path, bytes: &[u8], perms: Option<&Permissions>) -> io::Result<()> {
     let dir = path.parent().ok_or_else(|| io::Error::other("path has no parent directory"))?;
     fs::create_dir_all(dir)?;
+    #[cfg_attr(not(unix), allow(unused_mut))] // only Unix sets permissions below
     let mut builder = tempfile::Builder::new();
     #[cfg(unix)]
     builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o666)); // new files honour umask
@@ -279,8 +280,44 @@ fn write_atomic(path: &Path, bytes: &[u8], perms: Option<&Permissions>) -> io::R
         tmp.as_file().set_permissions(p.clone())?;
     }
     tmp.as_file().sync_all()?;
-    tmp.persist(path).map_err(|e| e.error)?;
-    Ok(())
+    #[cfg(windows)]
+    return persist_windows(tmp, path);
+    #[cfg(not(windows))]
+    {
+        tmp.persist(path).map_err(|e| e.error)?;
+        Ok(())
+    }
+}
+
+/// Windows refuses to replace a read-only file, and Defender/indexers briefly lock fresh files
+/// (ERROR_ACCESS_DENIED 5 / ERROR_SHARING_VIOLATION 32), so clear read-only and retry.
+#[cfg(windows)]
+fn persist_windows(mut tmp: tempfile::NamedTempFile, path: &Path) -> io::Result<()> {
+    // The temp file already carries the original permissions, so the read-only bit returns with the new content.
+    let was_readonly = fs::metadata(path).ok().filter(|m| m.permissions().readonly());
+    if let Some(m) = &was_readonly {
+        let mut p = m.permissions();
+        #[allow(clippy::permissions_set_readonly_false)] // Windows only: clears the attribute, not a mode bit
+        p.set_readonly(false);
+        fs::set_permissions(path, p)?;
+    }
+    for attempt in 1..=8 {
+        match tmp.persist(path) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                let busy = e.error.kind() == io::ErrorKind::PermissionDenied || matches!(e.error.raw_os_error(), Some(5 | 32));
+                if !busy || attempt == 8 {
+                    if let Some(m) = was_readonly {
+                        let _ = fs::set_permissions(path, m.permissions()); // target stays as it was
+                    }
+                    return Err(e.error);
+                }
+                tmp = e.file;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+    unreachable!()
 }
 
 fn bullets(header: &str, items: &[String], max: usize) -> String {
@@ -297,14 +334,14 @@ pub fn run(args: Value) -> Result<String, String> {
     let mut jobs: Vec<Job> = Vec::new();
     for e in a.edits {
         let path = canonical(&cwd.join(&e.path));
-        match jobs.iter_mut().find(|j| j.path == path) {
+        match jobs.iter_mut().find(|j| cwd::key(&j.path) == cwd::key(&path)) {
             Some(j) => j.entries.push(e),
             None => jobs.push(Job { display: e.path.clone(), path, entries: vec![e] }),
         }
     }
     // Locks are taken in sorted order (no deadlock between batches) and held across read -> write.
     let mut order: Vec<&Path> = jobs.iter().map(|j| j.path.as_path()).collect();
-    order.sort();
+    order.sort_by_key(|p| cwd::key(p)); // same order as the lock keys, or case-differing new files could deadlock
     let mut locks = Vec::new();
     for p in order {
         locks.push(lock::acquire(p).map_err(|e| format!("Error: cannot lock {}: {e} (0 files modified)", p.display()))?);

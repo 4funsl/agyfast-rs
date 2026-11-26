@@ -20,7 +20,7 @@ const HELP: &str = r#"agyfast-rs cli <tool> [--cwd DIR] [--max-chars N] [--json 
   worker-brief   print the /swarm worker brief with this binary's path filled in; set --cwd <WORKSPACE> before pasting
 --json / --stdin take the tool's full MCP argument object; flags given after them override it."#;
 
-/// The `/swarm` worker brief; `<AGY>` becomes the running binary's quoted path.
+/// The `/swarm` worker brief; `<AGY>` becomes the running binary's quoted path (a call expression on Windows).
 const WORKER_BRIEF: &str = r#"Navigate with ranged read_file (<=200 lines per call, parallel) plus the agyfast-rs CLI; reads are the largest cost, so add --definition to queries whose hits you will read or edit: each hit comes back with its whole definition, and you edit from those lines. Put per-query modifiers before their query:
   <AGY> cli search --cwd <WORKSPACE> --path src --definition --text "foo" --git "status --short"
   <AGY> cli outline --cwd <WORKSPACE> a.rs b.ts#Name,other   (file#Name prints those definitions' source)
@@ -31,9 +31,14 @@ Run every build/test/lint command through cli check. Discipline: smallest workin
 Rust in parallel workers: use the shared target/ and never set CARGO_TARGET_DIR (a cold build costs far more than waiting on Cargo's lock); run only your own test by name; leave cargo check, clippy and the full test run to the coordinator.
 The built-in edit_file replaces every match of its target, so make each target unique (include a neighbouring line only your block has) and never edit lines another worker owns."#;
 
+/// How a shell is told to run `exe`: POSIX single quotes, or PowerShell's call operator.
+fn invoke(exe: &str, win: bool) -> String {
+    if win { format!("& '{}'", exe.replace('\'', "''")) } else { tools::check::sh_quote(exe) }
+}
+
 fn worker_brief() -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|e| format!("Error: cannot locate this executable: {e}"))?;
-    Ok(WORKER_BRIEF.replace("<AGY>", &tools::check::sh_quote(&exe.display().to_string())))
+    Ok(WORKER_BRIEF.replace("<AGY>", &invoke(&exe.display().to_string(), cfg!(windows))))
 }
 
 fn object(text: &str) -> Result<Map<String, Value>, String> {
@@ -225,8 +230,14 @@ mod tests {
     fn worker_brief_names_this_executable() {
         let brief = worker_brief().unwrap();
         let exe = std::env::current_exe().unwrap();
-        assert!(exe.is_absolute() && brief.contains(&format!("'{}' cli check --cwd <WORKSPACE>", exe.display())), "{brief}");
+        assert!(exe.is_absolute() && brief.contains(&format!("{} cli check --cwd <WORKSPACE>", invoke(&exe.display().to_string(), cfg!(windows)))), "{brief}");
         assert!(!brief.contains("<AGY>") && brief.contains("--definition"));
         assert!(!brief.contains("CARGO_TARGET_DIR=") && brief.contains("--compact \"cargo test <module>::tests::<test_name>\""));
+    }
+
+    #[test]
+    fn invoke_quotes_per_shell() {
+        assert_eq!(invoke(r"C:\Users\o'k\a.exe", true), r"& 'C:\Users\o''k\a.exe'");
+        assert_eq!(invoke("/a b/x", false), "'/a b/x'");
     }
 }

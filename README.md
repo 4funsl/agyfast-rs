@@ -78,9 +78,10 @@ and copies the CLI to `~/.local/bin`. Start a new Antigravity session and confir
 `agy plugin list`.
 
 > [!NOTE]
-> **Windows:** build and test commands run through `sh`, so [Git for Windows](https://gitforwindows.org)
-> must be on `PATH`. The PowerShell scripts are new and have not been run on a Windows machine
-> yet — please open an issue if something fails. `.\build.ps1 -Check` builds and runs the tests
+> **Windows:** build and test commands run through `sh` when it is on `PATH` or in
+> [Git for Windows](https://gitforwindows.org) (`%ProgramFiles%\Git`); otherwise they fall back to
+> `cmd.exe`, where POSIX shell syntax does not work, so install Git for Windows. The PowerShell scripts
+> are new and have not been run on a Windows machine yet — please open an issue if something fails. `.\build.ps1 -Check` builds and runs the tests
 > without installing.
 
 ## Why Antigravity sessions get slow and expensive

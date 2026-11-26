@@ -1,6 +1,7 @@
 //! Cross-process advisory file locks for parallel `/swarm` edits.
 //! Lock files live in the system temp dir so `git status` stays clean.
 
+use crate::core::cwd::{key, simplify};
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -8,10 +9,10 @@ use std::path::{Path, PathBuf};
 /// Canonical form of a path that may not exist yet (new files).
 fn canonical(path: &Path) -> PathBuf {
     if let Ok(p) = path.canonicalize() {
-        return p;
+        return simplify(p);
     }
     match (path.parent().and_then(|p| p.canonicalize().ok()), path.file_name()) {
-        (Some(dir), Some(name)) => dir.join(name),
+        (Some(dir), Some(name)) => simplify(dir).join(name),
         _ => std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()),
     }
 }
@@ -20,8 +21,7 @@ fn canonical(path: &Path) -> PathBuf {
 /// The lock is released when the returned handle is dropped (or the process dies).
 pub fn acquire(path: &Path) -> io::Result<File> {
     // FNV-1a: stable across builds, unlike std's hasher; a collision only over-locks.
-    let hash = canonical(path)
-        .as_os_str()
+    let hash = key(&canonical(path))
         .as_encoded_bytes()
         .iter()
         .fold(0xcbf29ce484222325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3));

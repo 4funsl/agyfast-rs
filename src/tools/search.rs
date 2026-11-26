@@ -152,7 +152,7 @@ fn run_query(q: &Query, base: &Path) -> Result<Body, String> {
         "git" => run_git(&q.pattern, if root.is_file() { root.parent().unwrap_or(base) } else { &root }).map(Body::Text),
         "glob" => {
             let m = path_glob(&q.pattern)?;
-            let hidden = !(q.pattern.starts_with('.') || q.pattern.contains("/."));
+            let hidden = !(q.pattern.starts_with('.') || slashes(&q.pattern).contains("/."));
             let files: Vec<_> = walk(&root, q, hidden)?.into_iter().filter(|f| m(&root, f)).collect();
             Ok(list(&files, base, q.max_results.unwrap_or(80)))
         }
@@ -171,8 +171,15 @@ fn run_query(q: &Query, base: &Path) -> Result<Body, String> {
     }
 }
 
+/// Windows: `\` -> `/`, so paths and globs use one separator (fuzzy_score, basename lookup).
+/// Unix keeps `\`: it is a glob escape there.
+fn slashes(s: &str) -> String {
+    if cfg!(windows) { s.replace('\\', "/") } else { s.to_owned() }
+}
+
+/// Display path relative to `base`; callers only print it or score it (file access uses the absolute path).
 fn rel(base: &Path, p: &Path) -> String {
-    p.strip_prefix(base).unwrap_or(p).display().to_string()
+    slashes(&p.strip_prefix(base).unwrap_or(p).display().to_string())
 }
 
 /// Up to `max` paths, out of all of them.
@@ -183,6 +190,7 @@ fn list(paths: &[PathBuf], base: &Path, max: usize) -> Body {
 /// Glob matcher over a path relative to the search root; patterns without `/`
 /// match the file name only.
 fn path_glob(pattern: &str) -> Result<impl Fn(&Path, &Path) -> bool, String> {
+    let pattern = &slashes(pattern);
     let m: GlobMatcher = GlobBuilder::new(pattern)
         .literal_separator(true)
         .build()
@@ -888,6 +896,12 @@ mod tests {
         ] {
             assert!(git_args(bad).is_err(), "should reject `{bad}`: {:?}", git_args(bad));
         }
+    }
+
+    #[test]
+    fn slashes_only_on_windows() {
+        assert_eq!(slashes(r"src\**\*.rs"), if cfg!(windows) { "src/**/*.rs" } else { r"src\**\*.rs" });
+        assert_eq!(rel(Path::new("base"), &Path::new("base").join("src").join("a.rs")), "src/a.rs");
     }
 
     #[test]

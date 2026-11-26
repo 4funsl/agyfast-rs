@@ -15,14 +15,13 @@ if (-not (Test-Path $bin)) { throw "$bin not found; run .\build.ps1 first" }
 
 New-Item -ItemType Directory -Force -Path (Join-Path $pluginDir "bin"), (Join-Path $pluginDir "rules"), $cliDir | Out-Null
 Copy-Item (Join-Path $root "plugin\plugin.json") $pluginDir -Force
-Copy-Item (Join-Path $root "plugin\rules\AGENTS.md") (Join-Path $pluginDir "rules") -Force
 
 # A running MCP server locks its .exe: move the old one aside instead of overwriting it.
 function Install-Exe([string]$dest) {
   if (Test-Path $dest) {
-    $old = "$dest.old"
-    Remove-Item $old -Force -ErrorAction SilentlyContinue
-    Move-Item $dest $old -Force
+    # Leftovers of earlier updates stay locked until Antigravity restarts: delete best-effort, move aside under a unique name.
+    Get-ChildItem "$dest.old*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    Move-Item $dest "$dest.old.$PID.$(Get-Random)" -Force
   }
   Copy-Item $bin $dest -Force
 }
@@ -42,10 +41,17 @@ $hooks = Get-Content (Join-Path $root "plugin\hooks.json") -Raw | ConvertFrom-Js
 $hooks.'agyfast-rs-snapshot'.SessionStart[0].command = "`"$pluginExe`" hook session-start"
 Write-Json (Join-Path $pluginDir "hooks.json") $hooks
 
+# AGENTS.md rule 7 runs the CLI as a POSIX path; in PowerShell a quoted path needs the call operator.
+$rules = [IO.File]::ReadAllText((Join-Path $root "plugin\rules\AGENTS.md"))
+$posixCmd = '"$HOME/.gemini/config/plugins/agyfast-rs/bin/agyfast-rs" cli worker-brief'
+if (-not $rules.Contains($posixCmd)) { throw "plugin\rules\AGENTS.md no longer contains the worker-brief command; update install.ps1" }
+[IO.File]::WriteAllText((Join-Path $pluginDir "rules\AGENTS.md"), $rules.Replace($posixCmd, "& `"$pluginExe`" cli worker-brief"), (New-Object Text.UTF8Encoding $false))
+
 Write-Host "Installed plugin: $pluginDir"
 Write-Host "Installed CLI:    $cliDir\agyfast-rs.exe"
 if (-not (($env:PATH -split ';') -contains $cliDir)) { Write-Host "Add $cliDir to PATH to call agyfast-rs from a terminal." }
-if (-not (Get-Command sh -ErrorAction SilentlyContinue)) {
-  Write-Warning "sh was not found on PATH. run_checks and apply_edits' verify run commands through sh: install Git for Windows and add its bin folder to PATH."
+$gitSh = @("usr\bin", "bin") | ForEach-Object { Join-Path $env:ProgramFiles "Git\$_\sh.exe" } | Where-Object { Test-Path $_ }
+if (-not (Get-Command sh -ErrorAction SilentlyContinue) -and -not $gitSh) {
+  Write-Warning "sh was not found (not on PATH, not in Git for Windows). run_checks and apply_edits' verify will run commands through cmd.exe, where POSIX shell syntax (quotes, &&, pipes to sh tools) may not work: install Git for Windows."
 }
 Write-Host "Restart Antigravity, then check with: agy plugin list"
