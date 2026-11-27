@@ -254,7 +254,7 @@ fn split_chain(command: &str) -> Option<Vec<Step<'_>>> {
 fn chain_steps(parts: Vec<&str>, win: bool) -> Option<Vec<Step<'_>>> {
     const STATEFUL: &[&str] = &[
         "export", "source", ".", "set", "unset", "alias", "unalias", "shopt", "umask", "pushd", "popd", "eval", "exec",
-        "trap", "ulimit", "readonly", "declare", "typeset", "local", "hash", "shift",
+        "trap", "ulimit", "readonly", "declare", "typeset", "local", "hash", "shift", "exit", "return", "builtin", "command",
     ];
     let eq = |a: &str, b: &str| if win { a.eq_ignore_ascii_case(b) } else { a == b };
     parts
@@ -267,7 +267,7 @@ fn chain_steps(parts: Vec<&str>, win: bool) -> Option<Vec<Step<'_>>> {
                 let dir = w.get(1).filter(|_| i == 0 && w.len() == 2)?.1;
                 (!(dir.starts_with(['-', '~']) || dir.contains(['$', '*', '?']) || (win && dir.contains('%'))))
                     .then(|| Step::Cd(dir.trim_matches(['\'', '"'])))
-            } else if STATEFUL.iter().any(|&s| eq(prog, s)) {
+            } else if prog.contains(['\'', '"', '$', '%']) || STATEFUL.iter().any(|&s| eq(prog, s)) {
                 None
             } else {
                 Some(Step::Run(p))
@@ -1424,6 +1424,8 @@ error: test failed, to rerun pass `--bin demo`"##;
             "cargo check && $(echo cargo) test",
             "true && { cargo test; }",
             "export RUST_LOG=1 && cargo test",
+            "exit 0 && cargo test",
+            "'exit' 0 && cargo test",
             "source env.sh && cargo test",
             ". env.sh && cargo test",
             "set -e && cargo test",

@@ -37,20 +37,25 @@ fn git_start(child: Option<std::process::Child>) -> Option<RunningGit> {
     let mut out = child.stdout.take()?;
     let reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
-        let _ = out.by_ref().take(GIT_CAP as u64).read_to_end(&mut buf);
+        let _ = out.by_ref().take(GIT_CAP as u64 + 1).read_to_end(&mut buf);
         buf
     });
     Some(RunningGit { child, reader })
 }
 
-fn git_finish(running: Option<RunningGit>, deadline: Instant) -> Option<String> {
+fn git_finish(running: Option<RunningGit>, deadline: Instant) -> Option<(String, bool)> {
     let RunningGit { mut child, reader } = running?;
     let rem = deadline.saturating_duration_since(Instant::now());
     match child.wait_timeout(rem) {
         Ok(Some(st)) => {
-            let buf = reader.join().ok()?;
-            if st.success() || buf.len() == GIT_CAP {
-                Some(String::from_utf8_lossy(&buf).into_owned())
+            let mut buf = reader.join().ok()?;
+            let truncated = buf.len() > GIT_CAP;
+            if truncated {
+                let complete = buf[..GIT_CAP].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+                buf.truncate(complete);
+            }
+            if st.success() || truncated {
+                Some((String::from_utf8_lossy(&buf).into_owned(), truncated))
             } else {
                 None
             }
@@ -74,7 +79,7 @@ fn git_section(cwd: &Path) -> Option<String> {
     let log = git_finish(log, deadline);
     let mut text = String::from("Git: ");
     match status {
-        Some(s) => {
+        Some((s, truncated)) if !s.is_empty() => {
             let mut lines = s.lines();
             let head = lines.next().unwrap_or("").trim_start_matches("## ");
             let branch = head.split("...").next().unwrap_or(head);
@@ -83,11 +88,12 @@ fn git_section(cwd: &Path) -> Option<String> {
             for l in lines {
                 if l.starts_with("??") { untracked += 1 } else if !l.trim().is_empty() { dirty += 1 }
             }
-            text += &format!("branch `{branch}`, {dirty} dirty, {untracked} untracked");
+            let bound = if truncated { "+" } else { "" };
+            text += &format!("branch `{branch}`, {dirty}{bound} dirty, {untracked}{bound} untracked");
         }
-        None => text += "status unavailable",
+        _ => text += "status unavailable",
     }
-    for l in log.iter().flat_map(|l| l.lines()) {
+    for l in log.iter().flat_map(|(text, _)| text.lines()) {
         text += &format!("\n  - {}", fold(l, 72));
     }
     Some(text)
@@ -333,13 +339,15 @@ mod tests {
         let mut raw = vec![b'a'; 70 * 1024];
         raw[0] = 0xff;
         raw[1] = 0xfe;
+        raw[GIT_CAP - 3] = b'\n';
         std::fs::write(p.join("blob.bin"), &raw).unwrap();
         let hash = Command::new("git").args(["hash-object", "-w", "blob.bin"]).current_dir(p).output().unwrap();
         assert!(hash.status.success());
         let hash = String::from_utf8(hash.stdout).unwrap();
         let running = git_start(git_child(p, &["cat-file", "blob", hash.trim()]));
-        let out = git_finish(running, Instant::now() + GIT_TIMEOUT).unwrap();
-        assert_eq!(out.len(), GIT_CAP + 4); // 2 invalid bytes -> 2x U+FFFD (6 bytes)
+        let (out, truncated) = git_finish(running, Instant::now() + GIT_TIMEOUT).unwrap();
+        assert!(truncated && out.ends_with('\n'));
+        assert_eq!(out.len(), GIT_CAP + 2); // drop two partial bytes, gain four decoding invalid UTF-8
         assert!(out.starts_with("\u{FFFD}\u{FFFD}aaa"));
     }
 }

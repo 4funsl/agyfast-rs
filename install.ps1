@@ -18,12 +18,22 @@ Copy-Item (Join-Path $root "plugin\plugin.json") $pluginDir -Force
 
 # A running MCP server locks its .exe: move the old one aside instead of overwriting it.
 function Install-Exe([string]$dest) {
-  if (Test-Path $dest) {
-    # Leftovers of earlier updates stay locked until Antigravity restarts: delete best-effort, move aside under a unique name.
-    Get-ChildItem "$dest.old*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-    Move-Item $dest "$dest.old.$PID.$(Get-Random)" -Force
+  $stage = "$dest.new.$PID"
+  $backup = "$dest.old.$PID.$(Get-Random)"
+  try {
+    Copy-Item -LiteralPath $bin -Destination $stage -Force
+    if (Test-Path -LiteralPath $dest) {
+      Get-ChildItem "$dest.old*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+      Move-Item -LiteralPath $dest -Destination $backup
+    }
+    try { Move-Item -LiteralPath $stage -Destination $dest }
+    catch {
+      if (Test-Path -LiteralPath $backup) { Move-Item -LiteralPath $backup -Destination $dest }
+      throw
+    }
+  } finally {
+    Remove-Item -LiteralPath $stage -Force -ErrorAction SilentlyContinue
   }
-  Copy-Item $bin $dest -Force
 }
 $pluginExe = Join-Path $pluginDir "bin\agyfast-rs.exe"
 Install-Exe $pluginExe

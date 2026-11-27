@@ -282,7 +282,9 @@ fn write_atomic(path: &Path, bytes: &[u8], perms: Option<&Permissions>, #[cfg_at
     #[cfg_attr(not(unix), allow(unused_mut))] // only Unix sets permissions below
     let mut builder = tempfile::Builder::new();
     #[cfg(unix)]
-    builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o666)); // new files honour umask
+    if perms.is_none() {
+        builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o666)); // new files honour umask
+    }
     let mut tmp = builder.tempfile_in(dir)?;
     #[cfg(windows)]
     if perms.is_some() {
