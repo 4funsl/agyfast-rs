@@ -755,6 +755,7 @@ mod tests {
         let run_in = |path: &str| run(json!({"cwd": work.to_str().unwrap(), "edits": [{"path": path, "create": "x"}]}));
         let abs_out = outer.path().join("abs.txt");
         #[cfg_attr(not(unix), allow(unused_mut))] // only Unix adds the symlink case
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut bad = vec!["../esc.txt".to_string(), abs_out.to_str().unwrap().to_string()];
         #[cfg(unix)]
         {
