@@ -14,16 +14,8 @@ struct Args {
     #[serde(default)]
     outlines: Vec<String>,
     #[serde(default)]
-    slices: Vec<Slice>,
-    #[serde(default)]
     line_ranges: Vec<String>,
     max_chars: Option<usize>,
-}
-
-#[derive(Deserialize)]
-struct Slice {
-    path: String,
-    ranges: Vec<Vec<i64>>,
 }
 
 enum Job {
@@ -34,21 +26,14 @@ enum Job {
 
 pub fn run(args: Value) -> Result<String, String> {
     let args: Args = serde_json::from_value(args).map_err(|e| format!("Error: invalid arguments: {e}"))?;
-    if args.outlines.is_empty() && args.slices.is_empty() && args.line_ranges.is_empty() {
-        return Err("Error: provide at least one of `outlines`, `slices` or `lineRanges`".into());
+    if args.outlines.is_empty() && args.line_ranges.is_empty() {
+        return Err("Error: provide at least one of `outlines` or `lineRanges`".into());
     }
     if args.outlines.len() > 40 {
         return Err(format!("Error: at most 40 outlines, got {}", args.outlines.len()));
     }
     let dir = cwd::resolve(args.cwd.as_deref())?;
     let jobs: Vec<Job> = args.outlines.into_iter().map(Job::Outline)
-        .chain(args.slices.into_iter().map(|s| {
-            let ranges = s.ranges.iter().map(|r| match r[..] {
-                [a, b] => Ok((a, b)),
-                _ => Err(format!("each range must be [start, end], got {r:?}")),
-            }).collect();
-            Job::Slice(s.path, ranges)
-        }))
         .chain(args.line_ranges.iter().map(|s| parse_line_ranges(s)))
         .collect();
     let parts: Vec<String> = jobs.par_iter().map(|job| match job {
@@ -78,6 +63,10 @@ pub fn slice_file(path: &Path, shown: &str, ranges: &[Result<(i64, i64), String>
         Ok(t) => t,
         Err(e) => return format!("## Slice: {shown}\nERROR: {e}"),
     };
+    slice_text(shown, &text, ranges)
+}
+
+pub(crate) fn slice_text(shown: &str, text: &str, ranges: &[Result<(i64, i64), String>]) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let n = lines.len() as i64;
     let mut notes = Vec::new();
@@ -92,7 +81,7 @@ pub fn slice_file(path: &Path, shown: &str, ranges: &[Result<(i64, i64), String>
         };
         if a > b {
             notes.push(format!("--- L{a}-{b}: start is after end ---"));
-        } else if a > n || b < 1 {
+        } else if n == 0 || a > n || b < 1 {
             notes.push(format!("--- L{a}-{b}: out of bounds; file has {n} lines ---"));
         } else {
             ok.push((a.max(1), b.min(n)));
@@ -128,18 +117,28 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), body).unwrap();
         let out = run(json!({
             "cwd": dir.path(),
-            "slices": [{"path": "a.txt", "ranges": [[3, 4], [4, 6], [11, 50], [99, 120], [5, 2], [1]]}],
-            "lineRanges": ["a.txt:1-2,7", "missing.txt:1-5", "a.txt:x-y"],
+            "lineRanges": ["a.txt:3-4,4-6,11-50,99-120,5-2", "a.txt:1-2,7", "missing.txt:1-5", "a.txt:x-y"],
             "toolSummary": "ignored"
         })).unwrap();
         assert!(out.contains("## Slice: a.txt (12 lines)\n--- L3-6 ---\n3: рядок 3 🌍\n4: рядок 4 🌍"), "{out}");
         assert!(out.contains("--- L11-12 ---\n11: рядок 11 🌍\n12: рядок 12 🌍"));
         assert!(out.contains("--- L99-120: out of bounds; file has 12 lines ---"));
         assert!(out.contains("--- L5-2: start is after end ---"));
-        assert!(out.contains("ERROR: each range must be [start, end], got [1]"));
         assert!(out.contains("--- L1-2 ---\n1: рядок 1 🌍\n2: рядок 2 🌍\n--- L7-7 ---\n7: рядок 7 🌍"));
         assert!(out.contains("## Slice: missing.txt\nERROR:"));
         assert!(out.contains("ERROR: bad range \"x-y\""));
+    }
+
+    #[test]
+    fn empty_file_range_reports_out_of_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty.txt");
+        std::fs::write(&empty, "").unwrap();
+        let out = slice_file(&empty, "empty.txt", &[Ok((0, 5)), Ok((1, 5))]);
+        assert!(out.contains("## Slice: empty.txt (0 lines)"), "{out}");
+        assert!(out.contains("--- L0-5: out of bounds; file has 0 lines ---"), "{out}");
+        assert!(out.contains("--- L1-5: out of bounds; file has 0 lines ---"), "{out}");
+        assert!(!out.contains("--- L1-0 ---"), "{out}");
     }
 
     #[test]

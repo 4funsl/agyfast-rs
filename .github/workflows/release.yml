@@ -33,7 +33,7 @@ jobs:
         run: |
           name="agyfast-rs-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$name"
-          cp -R plugin install.sh install.ps1 LICENSE README.md "$name/"
+          cp -R plugin claude install.sh install.ps1 LICENSE README.md "$name/"
           if [[ "${{ matrix.target }}" == *windows* ]]; then
             cp "target/${{ matrix.target }}/release/agyfast-rs.exe" "$name/"
             7z a "$name.zip" "$name" > /dev/null

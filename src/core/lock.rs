@@ -1,20 +1,33 @@
 //! Cross-process advisory file locks for parallel `/swarm` edits.
 //! Lock files live in the system temp dir so `git status` stays clean.
 
-use crate::core::cwd::{key, simplify};
+use crate::core::cwd::{canonical, key};
 use std::fs::File;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-/// Canonical form of a path that may not exist yet (new files).
-fn canonical(path: &Path) -> PathBuf {
-    if let Ok(p) = path.canonicalize() {
-        return simplify(p);
+#[cfg(unix)]
+fn lock_dir() -> io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    // SAFETY: geteuid takes no arguments and has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    let dir = std::env::temp_dir().join(format!("agyfast-rs-locks-{uid}"));
+    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        result => result?,
     }
-    match (path.parent().and_then(|p| p.canonicalize().ok()), path.file_name()) {
-        (Some(dir), Some(name)) => simplify(dir).join(name),
-        _ => std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()),
+    let meta = dir.symlink_metadata()?;
+    if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "lock directory must be private and owned by the current user"));
     }
+    Ok(dir)
+}
+
+#[cfg(not(unix))]
+fn lock_dir() -> io::Result<std::path::PathBuf> {
+    let dir = std::env::temp_dir().join("agyfast-rs-locks");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
 }
 
 /// Take an exclusive lock for `path`, blocking until it is free.
@@ -25,8 +38,7 @@ pub fn acquire(path: &Path) -> io::Result<File> {
         .as_encoded_bytes()
         .iter()
         .fold(0xcbf29ce484222325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3));
-    let dir = std::env::temp_dir().join("agyfast-rs-locks");
-    std::fs::create_dir_all(&dir)?;
+    let dir = lock_dir()?;
     let file = File::options()
         .create(true)
         .truncate(false)

@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::cell::OnceCell;
 use std::collections::BTreeMap;
-use std::fs;
+use std::fmt::Write;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -72,14 +72,19 @@ pub fn run(args: Value) -> Result<String, String> {
         .par_iter()
         .enumerate()
         .map(|(i, q)| {
-            let header = format!(
+            let mut header = format!(
                 "## Query {} [{}] {}{}",
                 i + 1,
                 q.kind,
                 q.pattern,
                 q.path.as_deref().map(|p| format!(" (in {p})")).unwrap_or_default()
             );
-            (header, run_query(q, &base).unwrap_or_else(|e| Body::Text(format!("Error: {e}"))))
+            let mut unreadable = 0;
+            let body = run_query(q, &base, &mut unreadable).unwrap_or_else(|e| Body::Text(format!("Error: {e}")));
+            if unreadable > 0 {
+                header.push_str(&format!("\nIncomplete search: {unreadable} unreadable file(s)."));
+            }
+            (header, body)
         })
         .collect();
     let lens: Vec<usize> = parts.iter().map(|(h, b)| h.len() + 1 + b.full_len()).collect();
@@ -140,7 +145,7 @@ fn fit_list(items: &[String], total: usize, what: &str, room: usize) -> String {
     out.join("\n")
 }
 
-fn run_query(q: &Query, base: &Path) -> Result<Body, String> {
+fn run_query(q: &Query, base: &Path, unreadable: &mut usize) -> Result<Body, String> {
     if q.pattern.trim().is_empty() {
         return Err("pattern must not be empty".into());
     }
@@ -166,7 +171,7 @@ fn run_query(q: &Query, base: &Path) -> Result<Body, String> {
             let paths: Vec<_> = scored.into_iter().map(|(_, p)| PathBuf::from(p)).collect();
             Ok(list(&paths, base, q.max_results.unwrap_or(30)))
         }
-        "text" | "regex" => search(q, &root, base),
+        "text" | "regex" => search(q, &root, base, unreadable),
         other => Err(format!("unknown query type `{other}` (text, regex, glob, fuzzy, git)")),
     }
 }
@@ -252,6 +257,7 @@ fn walk(root: &Path, q: &Query, hidden: bool) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
+#[derive(Clone)]
 struct Line {
     n: u64,
     is_match: bool,
@@ -317,7 +323,7 @@ fn snippet(matcher: &RegexMatcher, line: &str, is_match: bool) -> String {
     format!("{}{}{}", if start > 0 { "..." } else { "" }, &line[start..end], if end < line.len() { "..." } else { "" })
 }
 
-fn search(q: &Query, root: &Path, base: &Path) -> Result<Body, String> {
+fn search(q: &Query, root: &Path, base: &Path, unreadable: &mut usize) -> Result<Body, String> {
     let mode = q.output_mode.as_deref().unwrap_or("content");
     if !["content", "files_with_matches", "count"].contains(&mode) {
         return Err(format!("invalid outputMode `{mode}`"));
@@ -337,22 +343,28 @@ fn search(q: &Query, root: &Path, base: &Path) -> Result<Body, String> {
     }
     let matcher = mb.build(&q.pattern).map_err(|e| format!("invalid {} pattern: {e}", q.kind))?;
     let files = walk(root, q, true)?;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let errors = AtomicUsize::new(0);
     let hits: Vec<(PathBuf, Collect)> = files
         .into_par_iter()
         .filter_map(|f| {
             let mut sink =
                 Collect { matcher: &matcher, cap: max, lines: Vec::new(), stored: 0, count: 0, closed: false, binary: false };
-            SearcherBuilder::new()
+            if SearcherBuilder::new()
                 .binary_detection(BinaryDetection::quit(0))
                 .multi_line(q.multiline)
                 .before_context(ctx)
                 .after_context(ctx)
                 .build()
                 .search_path(&matcher, &f, &mut sink)
-                .ok()?;
+                .is_err() {
+                errors.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
             (sink.count > 0 && !sink.binary).then_some((f, sink))
         })
         .collect();
+    *unreadable = errors.into_inner();
     if hits.is_empty() {
         return Ok(Body::Text("(no matches)".into()));
     }
@@ -366,12 +378,12 @@ fn search(q: &Query, root: &Path, base: &Path) -> Result<Body, String> {
     }
     let mut files: Vec<FileHits> = hits
         .into_iter()
-        .map(|(f, s)| FileHits { path: rel(base, &f), lines: if def { widen(s.lines, &f, &matcher) } else { s.lines }, abs: f, count: s.count })
+        .map(|(f, s)| FileHits { path: rel(base, &f), lines: s.lines, abs: f, count: s.count })
         .collect();
     // Source before documentation, so a capped result is not spent on Markdown; the sort is stable.
     files.sort_by_key(|f| is_doc(&f.path));
     let split = files.partition_point(|f| !is_doc(&f.path));
-    Ok(Body::Hits(Hits { files, split, ctx, cap: max, def }))
+    Ok(Body::Hits(Hits { files, split, ctx, cap: max, matcher: def.then_some(matcher) }))
 }
 
 /// Lines `(first, last)` shown for a hit at line `n`: its innermost enclosing definition, clipped
@@ -386,20 +398,22 @@ fn window(syms: &[(usize, usize, String)], n: usize, last: usize) -> (usize, usi
 }
 
 /// Replaces matching lines (searched without context) by the union of their windows.
-fn widen(lines: Vec<Line>, path: &Path, matcher: &RegexMatcher) -> Vec<Line> {
-    let Ok(bytes) = fs::read(path) else { return lines };
-    let text = String::from_utf8_lossy(&bytes);
+fn widen(lines: &[Line], path: &Path, syms: &OnceCell<Vec<(usize, usize, String)>>, matcher: &RegexMatcher) -> Vec<Line> {
+    let Ok(text) = outline::read_text(path) else {
+        syms.get_or_init(Vec::new);
+        return lines.to_vec();
+    };
+    let syms = syms.get_or_init(|| outline::symbols_in(path, &text));
     let src: Vec<&str> = text.lines().collect();
-    let syms = outline::symbols(path);
     let mut keep: BTreeMap<usize, Line> = BTreeMap::new();
-    for l in &lines {
-        let (a, b) = window(&syms, l.n as usize, src.len());
+    for l in lines {
+        let (a, b) = window(syms, l.n as usize, src.len());
         for n in a..=b {
             keep.entry(n).or_insert_with(|| Line { n: n as u64, is_match: false, text: snippet(matcher, src.get(n - 1).unwrap_or(&""), false) });
         }
     }
     for l in lines {
-        keep.insert(l.n as usize, l);
+        keep.insert(l.n as usize, l.clone());
     }
     keep.into_values().collect()
 }
@@ -426,8 +440,8 @@ struct Hits {
     split: usize,
     ctx: usize,
     cap: usize,
-    /// `definition: true`: lines are whole windows, not context.
-    def: bool,
+    /// `Some` when `definition: true`: widens visited files lazily.
+    matcher: Option<RegexMatcher>,
 }
 
 const MAX_SIG: usize = 80;
@@ -444,10 +458,19 @@ impl Hits {
     fn fit(&self, room: usize) -> String {
         let n = self.files.len();
         let syms: Vec<OnceCell<Vec<(usize, usize, String)>>> = (0..n).map(|_| OnceCell::new()).collect();
+        let widened: Vec<OnceCell<Vec<Line>>> = (0..n).map(|_| OnceCell::new()).collect();
         let stored: Vec<usize> = self.files.iter().map(|f| f.lines.iter().filter(|l| l.is_match).count()).collect();
         let (mut shown, mut blocks) = (vec![0; n], vec![String::new(); n]);
         let (mut used, mut total) = (0, 0); // `used`: block bytes, one newline each
         let mut tier = 0..self.split;
+        let render = |i: usize, k: usize| {
+            let f = &self.files[i];
+            let lines = match &self.matcher {
+                Some(m) => widened[i].get_or_init(|| widen(&f.lines, &f.abs, &syms[i], m)).as_slice(),
+                None => f.lines.as_slice(),
+            };
+            self.block(i, k, lines, syms[i].get_or_init(|| outline::symbols(&f.abs)))
+        };
         'fill: loop {
             let before = total;
             for i in tier.clone() {
@@ -457,12 +480,12 @@ impl Hits {
                 if total == self.cap {
                     break 'fill;
                 }
-                let block = self.block(i, shown[i] + 1, syms[i].get_or_init(|| outline::symbols(&self.files[i].abs)));
+                let block = render(i, shown[i] + 1);
                 shown[i] += 1;
                 let next = used + block.len() + 1 - if blocks[i].is_empty() { 0 } else { blocks[i].len() + 1 };
                 if next + self.notice(&shown, room / 4).len() > room {
                     shown[i] -= 1;
-                    break 'fill;
+                    continue;
                 }
                 (used, blocks[i], total) = (next, block, total + 1);
             }
@@ -473,8 +496,23 @@ impl Hits {
                 tier = self.split..n; // sources exhausted: now the documentation files
             }
         }
+        let notice = if total == 0
+            && let Some(i) = (0..n).find(|&i| stored[i] > 0)
+        {
+            shown[i] = 1;
+            let notice = self.notice(&shown, room / 4);
+            let avail = room.saturating_sub(if notice.is_empty() { 0 } else { notice.len() + 1 });
+            if avail > 0 {
+                blocks[i] = budget::fold(&render(i, 1), avail);
+                notice
+            } else {
+                shown[i] = 0;
+                self.notice(&shown, room)
+            }
+        } else {
+            self.notice(&shown, room.saturating_sub(used))
+        };
         let mut out: Vec<String> = blocks.into_iter().filter(|b| !b.is_empty()).collect();
-        let notice = self.notice(&shown, room.saturating_sub(used));
         if !notice.is_empty() {
             out.push(notice);
         }
@@ -482,15 +520,16 @@ impl Hits {
     }
 
     /// File `i` with its first `n` hits, their context and enclosing-definition markers.
-    fn block(&self, i: usize, n: usize, syms: &[(usize, usize, String)]) -> String {
+    fn block(&self, i: usize, n: usize, lines: &[Line], syms: &[(usize, usize, String)]) -> String {
         let f = &self.files[i];
+        let def = self.matcher.is_some();
         let mut out: Vec<(u64, String)> = vec![(0, f.path.clone())];
         let (mut seen, mut after, mut last_hit, mut cur, mut hi) = (0, 0, 1, None, 0);
-        for l in &f.lines {
+        for l in lines {
             if l.is_match {
                 if seen == n {
                     // Later hits inside the last shown window are part of the definition.
-                    if self.def && l.n as usize <= hi {
+                    if def && l.n as usize <= hi {
                         out.push((l.n, format!(" {}- {}", l.n, l.text)));
                         continue;
                     }
@@ -518,7 +557,7 @@ impl Hits {
                 last_hit = out.len();
             } else {
                 if seen == n {
-                    if self.def {
+                    if def {
                         if l.n as usize > hi {
                             break;
                         }
@@ -541,23 +580,33 @@ impl Hits {
         if done == total {
             return String::new();
         }
-        let omitted: Vec<(&str, usize)> =
-            self.files.iter().zip(shown).filter(|(f, s)| f.count > **s).map(|(f, s)| (f.path.as_str(), f.count - s)).collect();
+        let (mut omitted_count, mut items_len) = (0usize, 0usize);
+        for (f, &s) in self.files.iter().zip(shown) {
+            if f.count > s {
+                items_len += usize::from(omitted_count > 0) + 2 + f.path.len() + (f.count - s).ilog10() as usize + 1;
+                omitted_count += 1;
+            }
+        }
         let mut out = format!("... [truncated: showing {done} of {total} matching lines in {} files; not shown:", self.files.len());
-        let items: Vec<String> = omitted.iter().enumerate().map(|(k, (p, c))| format!("{} {p} {c}", if k > 0 { "," } else { "" })).collect();
-        let all_fit = out.len() + items.iter().map(String::len).sum::<usize>() < room;
+        let all_fit = out.len() + items_len < room;
         let (mut listed, mut rest) = (0, total - done);
-        for (item, (_, c)) in items.iter().zip(&omitted) {
-            if !all_fit && out.len() + item.len() + 32 > room {
+        for (f, &s) in self.files.iter().zip(shown) {
+            if f.count <= s {
+                continue;
+            }
+            let c = f.count - s;
+            let item_len = usize::from(listed > 0) + 2 + f.path.len() + c.ilog10() as usize + 1;
+            if !all_fit && out.len() + item_len + 32 > room {
                 break; // keep room for the summary
             }
-            out += item;
+            let _ = write!(out, "{} {} {c}", if listed > 0 { "," } else { "" }, f.path);
             (listed, rest) = (listed + 1, rest - c);
         }
-        if listed < omitted.len() {
-            out += &format!("{} +{} files ({rest} lines)", if listed > 0 { "," } else { "" }, omitted.len() - listed);
+        if listed < omitted_count {
+            let _ = write!(out, "{} +{} files ({rest} lines)", if listed > 0 { "," } else { "" }, omitted_count - listed);
         }
-        out + "]"
+        out.push(']');
+        out
     }
 }
 
@@ -696,7 +745,7 @@ fn check_list_only(sub: &str, rest: &[String], r: &ListRules) -> Result<(), Stri
                 return bad(a);
             }
         } else if a.starts_with('-') && a.len() > 1 {
-            if sub == "tag" && a[2..].chars().all(|c| c.is_ascii_digit()) && a.starts_with("-n") {
+            if sub == "tag" && a.strip_prefix("-n").is_some_and(|d| d.chars().all(|c| c.is_ascii_digit())) {
                 listing = true;
             } else if a[1..].chars().all(|c| r.shorts.contains(c)) {
                 listing |= a.contains('l');
@@ -775,11 +824,9 @@ fn git_args(pattern: &str) -> Result<Vec<String>, String> {
             if !rest.first().is_some_and(|a| a == "list" || a == "show") {
                 return Err("only `stash list` and `stash show` are allowed".into());
             }
-            if rest[0] == "show" {
-                args.extend(["show", "--no-ext-diff", "--no-textconv"].map(String::from));
-                args.extend(rest[1..].iter().cloned());
-                return Ok(args);
-            }
+            args.extend([rest[0].as_str(), "--no-ext-diff", "--no-textconv"].map(String::from));
+            args.extend(rest[1..].iter().cloned());
+            return Ok(args);
         }
         "diff" | "log" | "show" => args.extend(["--no-ext-diff", "--no-textconv"].map(String::from)),
         "blame" => args.push("--no-textconv".into()),
@@ -870,12 +917,14 @@ mod tests {
             "status --short", "git log -n 5 --oneline", "diff --stat HEAD~1", "show HEAD:Cargo.toml", "blame -L 1,5 x.rs",
             "ls-files", "rev-parse HEAD", "grep -n foo", "grep -C 2 foo", "describe --tags", "shortlog -sn",
             "branch --list", "branch -av", "branch --show-current", "branch --color --list main*",
-            "branch --contains HEAD", "tag -l v*", "tag -n5", "tag --column=never", "remote -v",
-            "remote get-url origin", "remote show origin", "stash list", "stash show -p", "diff --text",
+            "branch --contains HEAD", "tag -l v*", "tag -n", "tag -n5", "tag --column=never", "remote -v",
+            "remote get-url origin", "remote show origin", "stash list", "stash list -p", "stash show -p", "diff --text",
         ] {
             assert!(git_args(ok).is_ok(), "should accept `{ok}`: {:?}", git_args(ok));
         }
         assert_eq!(git_args("log -1").unwrap(), ["log", "--no-ext-diff", "--no-textconv", "-1"]);
+        assert_eq!(git_args("stash list -p").unwrap(), ["stash", "list", "--no-ext-diff", "--no-textconv", "-p"]);
+        assert_eq!(git_args("stash show -p").unwrap(), ["stash", "show", "--no-ext-diff", "--no-textconv", "-p"]);
         assert_eq!(git_args("remote show origin").unwrap(), ["remote", "show", "-n", "origin"]);
         assert_eq!(git_args("shortlog -sn").unwrap(), ["shortlog", "-sn", "HEAD"]);
     }
@@ -886,7 +935,7 @@ mod tests {
             "commit -m evil", "push origin main", "reset --hard", "checkout main", "clean -fd", "config core.pager sh",
             "-c core.pager=sh log", "--git-dir=/x log", "-C /tmp status", "branch -D feature", "branch -Dmain",
             "branch new-branch", "branch --color new-branch", "branch -l --no-list evil", "branch --color -- x",
-            "branch --sort -D", "tag v1.0.0", "tag -d v1", "tag -l -am msg v1", "tag --color=always evil",
+            "branch --sort -D", "tag v1.0.0", "tag -d v1", "tag -l -am msg v1", "tag -я", "tag --color=always evil",
             "remote add origin https://x", "remote show https://x/y", "remote set-url origin x", "stash",
             "stash pop", "stash drop", "diff --output=/tmp/leak", "diff --out=/tmp/leak", "diff -c core.pager=sh",
             "diff -ccore.pager=sh", "log --ext-diff", "log --ext", "show --textconv", "show --textc",
@@ -1053,8 +1102,8 @@ mod tests {
         let out = call(dir.path(), json!([{"type": "text", "pattern": "hit", "definition": true, "contextLines": 3}]));
         if cfg!(feature = "lang-rust") {
             assert_eq!(out, "## Query 1 [text] hit\na.rs\n L1-5 fn first()\n 1- fn first() {\n 2-     let a = 1;\n 3:     hit(a);\n 4:     hit(a);\n 5- }", "{out}");
+            assert!(!out.contains("second") && !out.contains("other"), "{out}");
         }
-        assert!(!out.contains("second") && !out.contains("other"), "{out}");
         // The tip shows for plain content queries only, never for glob-only or all-definition batches.
         let run_tip = |q: Value| run(json!({"cwd": dir.path(), "queries": q})).unwrap().ends_with(TIP);
         assert!(run_tip(json!([{"type": "text", "pattern": "hit"}])));
@@ -1070,9 +1119,9 @@ mod tests {
         fs::write(dir.path().join("a.rs"), format!("fn long() {{\n{body}}}\n")).unwrap(); // 100 lines
         fs::write(dir.path().join("a.txt"), (1..=20).map(|i| format!("t{i}\n")).collect::<String>()).unwrap();
         let out = call(dir.path(), json!([{"type": "text", "pattern": "line50;", "definition": true}]));
-        assert!(out.contains(" 40-     line40;") && out.contains(" 51-     line51;") && out.contains(" 60-     line60;"), "{out}");
-        assert!(!out.contains(" 39-") && !out.contains(" 61-"), "{out}");
         if cfg!(feature = "lang-rust") {
+            assert!(out.contains(" 40-     line40;") && out.contains(" 51-     line51;") && out.contains(" 60-     line60;"), "{out}");
+            assert!(!out.contains(" 39-") && !out.contains(" 61-"), "{out}");
             assert!(out.contains(" L1-100 fn long()"), "{out}");
         }
         let out = call(dir.path(), json!([{"type": "text", "pattern": "t10", "definition": true}]));
@@ -1086,5 +1135,18 @@ mod tests {
         fs::write(dir.path().join("a.rs"), src).unwrap();
         let out = run(json!({"cwd": dir.path(), "queries": [{"type": "text", "pattern": "hit", "definition": true}], "maxChars": 500})).unwrap();
         assert!(out.len() <= 500, "{}", out.len());
+
+        if !cfg!(feature = "lang-rust") {
+            return;
+        }
+        // An oversized first definition still returns >= 1 hit folded to budget, and skips to smaller files when any fit.
+        let big: String = (0..40).map(|i| format!("    let x{i} = \"{}\";\n", "y".repeat(30))).collect();
+        fs::write(dir.path().join("a.rs"), format!("fn huge0() {{\n{big}    hit();\n}}\nfn huge1() {{\n{big}    hit();\n}}\n")).unwrap();
+        let out = run(json!({"cwd": dir.path(), "queries": [{"type": "text", "pattern": "hit", "definition": true}], "maxChars": 500})).unwrap();
+        assert!(out.len() <= 500 && out.contains("a.rs") && out.contains("showing 1 of 2"), "{out}");
+
+        fs::write(dir.path().join("b.rs"), "fn small() {\n    hit();\n}\n").unwrap();
+        let out = run(json!({"cwd": dir.path(), "queries": [{"type": "text", "pattern": "hit", "definition": true}], "maxChars": 500})).unwrap();
+        assert!(out.len() <= 500 && out.contains("b.rs") && out.contains("fn small()") && out.contains("showing 1 of 3"), "{out}");
     }
 }

@@ -58,16 +58,6 @@ struct Plan {
     summary: String,
 }
 
-/// Canonical path of a file that may not exist yet; symlinks resolve to their target.
-fn canonical(p: &Path) -> PathBuf {
-    p.canonicalize().map(cwd::simplify).unwrap_or_else(|_| {
-        match (p.parent().and_then(|d| d.canonicalize().ok()), p.file_name()) {
-            (Some(dir), Some(name)) => cwd::simplify(dir).join(name),
-            _ => std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()),
-        }
-    })
-}
-
 fn line_count(s: &str) -> i64 {
     (s.matches('\n').count() + usize::from(!s.is_empty() && !s.ends_with('\n'))) as i64
 }
@@ -97,14 +87,26 @@ fn snippet(lines: &[&str], from: usize, count: usize) -> String {
 fn closest(content: &str, target: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let tl: Vec<&str> = target.lines().collect();
-    let squash = |s: &str| s.split_whitespace().collect::<String>();
-    let want = squash(target);
+    let want: String = target.split_whitespace().collect();
     if !want.is_empty() {
-        for i in 0..lines.len() {
-            let window: String = lines[i..(i + tl.len()).min(lines.len())].iter().map(|l| squash(l)).collect();
-            if window.contains(&want) {
-                return format!(" Whitespace-insensitive match at line {} (fix indentation/spacing):{}", i + 1, snippet(&lines, i, tl.len()));
+        let mut squashed = String::with_capacity(content.len());
+        let mut sq_starts = Vec::with_capacity(lines.len());
+        for l in &lines {
+            sq_starts.push(squashed.len());
+            for w in l.split_whitespace() {
+                squashed.push_str(w);
             }
+        }
+        if let Some(pos) = squashed.find(&want) {
+            let i = sq_starts.partition_point(|&s| s <= pos).saturating_sub(1);
+            return format!(" Whitespace-insensitive match at line {} (fix indentation/spacing):{}", i + 1, snippet(&lines, i, tl.len()));
+        }
+    }
+    let mut index: std::collections::HashMap<&str, (usize, usize)> = std::collections::HashMap::with_capacity(lines.len());
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim();
+        if t.len() >= 3 {
+            index.entry(t).and_modify(|e| e.0 += 1).or_insert((1, i));
         }
     }
     let best = tl
@@ -112,10 +114,7 @@ fn closest(content: &str, target: &str) -> String {
         .enumerate()
         .map(|(idx, t)| (idx, t.trim()))
         .filter(|(_, t)| t.len() >= 3)
-        .filter_map(|(idx, t)| {
-            let hits: Vec<usize> = (0..lines.len()).filter(|&i| lines[i].trim() == t).collect();
-            (!hits.is_empty()).then(|| (hits.len(), usize::MAX - t.len(), hits[0].saturating_sub(idx)))
-        })
+        .filter_map(|(idx, t)| index.get(t).map(|&(count, first)| (count, usize::MAX - t.len(), first.saturating_sub(idx))))
         .min();
     match best {
         Some((_, _, at)) => format!(" Closest match near line {}:{}", at + 1, snippet(&lines, at, tl.len())),
@@ -140,16 +139,15 @@ fn window(starts: &[usize], len: usize, s: Option<usize>, e: Option<usize>) -> R
 }
 
 fn plan_hunks(display: &str, content: &str, hunks: &[&Hunk]) -> Result<(String, String), String> {
-    let crlf = content.contains("\r\n");
-    let fix = |s: &str| {
-        let s = s.replace("\r\n", "\n");
-        if crlf { s.replace('\n', "\r\n") } else { s }
-    };
-    let starts: Vec<usize> = std::iter::once(0).chain(content.match_indices('\n').map(|(i, _)| i + 1)).collect();
+    let crs: Vec<_> = content.match_indices("\r\n").enumerate().map(|(i, (o, _))| o - i).collect();
+    let normalized = if crs.is_empty() { std::borrow::Cow::Borrowed(content) } else { std::borrow::Cow::Owned(content.replace("\r\n", "\n")) };
+    // CRs before a logical offset are the extra bytes at its on-disk position.
+    let original = |o| o + crs.partition_point(|&cr| cr < o);
+    let starts: Vec<_> = std::iter::once(0).chain(normalized.match_indices('\n').map(|(i, _)| i + 1)).collect();
     let mut spans = Vec::new();
     let mut errors = Vec::new();
     for (i, h) in hunks.iter().enumerate() {
-        let (t, r) = (fix(&h.target), fix(&h.replacement));
+        let (t, r) = (h.target.replace("\r\n", "\n"), h.replacement.replace("\r\n", "\n"));
         let err = |m: String| format!("{display} hunk #{}: {m}", i + 1);
         if t.is_empty() {
             errors.push(err("empty target".into()));
@@ -159,21 +157,26 @@ fn plan_hunks(display: &str, content: &str, hunks: &[&Hunk]) -> Result<(String, 
             errors.push(err("replacement equals target (no-op)".into()));
             continue;
         }
-        let (ws, we) = match window(&starts, content.len(), h.start_line, h.end_line) {
+        let (ws, we) = match window(&starts, normalized.len(), h.start_line, h.end_line) {
             Ok(w) => w,
             Err(m) => {
                 errors.push(err(m));
                 continue;
             }
         };
-        let found: Vec<usize> = content[ws..we].match_indices(&t).map(|(o, _)| o + ws).collect();
+        let region = &normalized[ws..we];
+        let found: Vec<_> = region.match_indices(&t).map(|(o, _)| ws + o).collect();
+        if !h.replace_all && let [first] = found.as_slice() && region.rfind(&t) != Some(first - ws) {
+            errors.push(err("target has overlapping matches. Add more context or use replaceAll: true.".into()));
+            continue;
+        }
         let ranged = h.start_line.is_some() || h.end_line.is_some();
         match found.len() {
             0 => {
                 let outside: Vec<String> =
-                    content.match_indices(&t).take(3).map(|(o, _)| line_range(&starts, o, t.len())).collect();
+                    normalized.match_indices(&t).take(3).map(|(o, _)| line_range(&starts, o, t.len())).collect();
                 let hint = if outside.is_empty() {
-                    closest(content, &t)
+                    closest(&normalized, &t)
                 } else {
                     format!(" Exact match found outside range at {} (adjust or omit startLine/endLine).", outside.join(", "))
                 };
@@ -187,13 +190,19 @@ fn plan_hunks(display: &str, content: &str, hunks: &[&Hunk]) -> Result<(String, 
                     at.join(", ")
                 )));
             }
-            _ => spans.extend(found.into_iter().map(|o| (o, o + t.len(), r.clone(), i))),
+            _ => spans.extend(found.into_iter().map(|o| {
+                let (s, e) = (original(o), original(o + t.len()));
+                let line = line_of(&starts, o);
+                let line_end = starts.get(line).or_else(|| starts.get(line - 1));
+                let crlf = line_end.is_some_and(|&end| end > 0 && crs.binary_search(&(end - 1)).is_ok());
+                (s, e, if crlf { r.replace('\n', "\r\n") } else { r.clone() }, i, o)
+            })),
         }
     }
     spans.sort_by_key(|s| (s.0, s.1));
     for w in spans.windows(2) {
         if w[1].0 < w[0].1 {
-            errors.push(format!("{display}: hunk #{} and hunk #{} overlap near line {}", w[0].3 + 1, w[1].3 + 1, line_of(&starts, w[1].0)));
+            errors.push(format!("{display}: hunk #{} and hunk #{} overlap near line {}", w[0].3 + 1, w[1].3 + 1, line_of(&starts, w[1].4)));
         }
     }
     if !errors.is_empty() {
@@ -201,7 +210,7 @@ fn plan_hunks(display: &str, content: &str, hunks: &[&Hunk]) -> Result<(String, 
     }
     let mut out = String::with_capacity(content.len());
     let mut cursor = 0;
-    for (s, e, r, _) in &spans {
+    for (s, e, r, _, _) in &spans {
         out.push_str(&content[cursor..*s]);
         out.push_str(r);
         cursor = *e;
@@ -267,21 +276,36 @@ fn plan(job: &Job) -> Result<Plan, String> {
 }
 
 /// Temp file in the target's directory, then rename over it: readers never see a partial file.
-fn write_atomic(path: &Path, bytes: &[u8], perms: Option<&Permissions>) -> io::Result<()> {
+fn write_atomic(path: &Path, bytes: &[u8], perms: Option<&Permissions>, #[cfg_attr(not(windows), allow(unused_variables))] replaced: &mut bool) -> io::Result<()> {
     let dir = path.parent().ok_or_else(|| io::Error::other("path has no parent directory"))?;
     fs::create_dir_all(dir)?;
     #[cfg_attr(not(unix), allow(unused_mut))] // only Unix sets permissions below
     let mut builder = tempfile::Builder::new();
     #[cfg(unix)]
-    builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o666)); // new files honour umask
+    if perms.is_none() {
+        builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o666)); // new files honour umask
+    }
     let mut tmp = builder.tempfile_in(dir)?;
+    #[cfg(windows)]
+    if perms.is_some() {
+        // CopyFileEx preserves named streams. Rewrite only the unnamed stream.
+        fs::copy(path, tmp.path())?;
+        if let Some(p) = perms.filter(|p| p.readonly()) {
+            let mut writable = p.clone();
+            #[allow(clippy::permissions_set_readonly_false)]
+            writable.set_readonly(false);
+            tmp.as_file().set_permissions(writable)?;
+        }
+        tmp.as_file().set_len(0)?;
+    }
     tmp.write_all(bytes)?;
+    #[cfg(not(windows))]
     if let Some(p) = perms {
         tmp.as_file().set_permissions(p.clone())?;
     }
     tmp.as_file().sync_all()?;
     #[cfg(windows)]
-    return persist_windows(tmp, path);
+    return persist_windows(tmp, path, perms, replaced);
     #[cfg(not(windows))]
     {
         tmp.persist(path).map_err(|e| e.error)?;
@@ -291,9 +315,10 @@ fn write_atomic(path: &Path, bytes: &[u8], perms: Option<&Permissions>) -> io::R
 
 /// Windows refuses to replace a read-only file, and Defender/indexers briefly lock fresh files
 /// (ERROR_ACCESS_DENIED 5 / ERROR_SHARING_VIOLATION 32), so clear read-only and retry.
+/// `tempfile`'s Windows `persist` resets attributes to `FILE_ATTRIBUTE_NORMAL`, so re-apply read-only after.
 #[cfg(windows)]
-fn persist_windows(mut tmp: tempfile::NamedTempFile, path: &Path) -> io::Result<()> {
-    // The temp file already carries the original permissions, so the read-only bit returns with the new content.
+fn persist_windows(mut tmp: tempfile::NamedTempFile, path: &Path, perms: Option<&Permissions>, replaced: &mut bool) -> io::Result<()> {
+    let is_busy = |e: &io::Error| e.kind() == io::ErrorKind::PermissionDenied || matches!(e.raw_os_error(), Some(5 | 32));
     let was_readonly = fs::metadata(path).ok().filter(|m| m.permissions().readonly());
     if let Some(m) = &was_readonly {
         let mut p = m.permissions();
@@ -303,10 +328,21 @@ fn persist_windows(mut tmp: tempfile::NamedTempFile, path: &Path) -> io::Result<
     }
     for attempt in 1..=8 {
         match tmp.persist(path) {
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                *replaced = true;
+                if let Some(p) = perms.filter(|p| p.readonly()) {
+                    for perm_attempt in 1..=8 {
+                        match fs::set_permissions(path, p.clone()) {
+                            Ok(()) => break,
+                            Err(e) if is_busy(&e) && perm_attempt < 8 => std::thread::sleep(std::time::Duration::from_millis(20)),
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
+                return Ok(());
+            }
             Err(e) => {
-                let busy = e.error.kind() == io::ErrorKind::PermissionDenied || matches!(e.error.raw_os_error(), Some(5 | 32));
-                if !busy || attempt == 8 {
+                if !is_busy(&e.error) || attempt == 8 {
                     if let Some(m) = was_readonly {
                         let _ = fs::set_permissions(path, m.permissions()); // target stays as it was
                     }
@@ -325,6 +361,54 @@ fn bullets(header: &str, items: &[String], max: usize) -> String {
     format!("{header}\n{}", body.join("\n"))
 }
 
+fn rollback(w: &Plan) -> Result<(), String> {
+    let res = match &w.old {
+        Some((bytes, perms)) => write_atomic(&w.path, bytes, Some(perms), &mut false),
+        None => fs::remove_file(&w.path),
+    };
+    res.map_err(|e| format!("{}: {e}", w.display))
+}
+
+fn commit<'a>(plans: &'a [Plan], best_effort: bool, failed: &mut Vec<String>) -> Result<(Vec<&'a Plan>, Vec<String>), String> {
+    let mut written: Vec<&Plan> = Vec::new();
+    let mut rb_err: Vec<String> = Vec::new();
+    for p in plans {
+        let mut replaced = false;
+        match write_atomic(&p.path, &p.new, p.old.as_ref().map(|o| &o.1), &mut replaced) {
+            Ok(()) => written.push(p),
+            Err(e) if best_effort => {
+                let mut msg = format!("{}: write failed: {e}", p.display);
+                if replaced && let Err(re) = rollback(p) {
+                    msg.push_str(&format!("; rollback also failed: {re}"));
+                    rb_err.push(re);
+                }
+                failed.push(msg);
+            }
+            Err(e) => {
+                if replaced {
+                    written.push(p);
+                }
+                for w in &written {
+                    if let Err(re) = rollback(w) {
+                        rb_err.push(re);
+                    }
+                }
+                if rb_err.is_empty() {
+                    return Err(format!("Error: write failed for {}: {e}; rolled back {} file(s) (0 files modified)", p.path.display(), written.len()));
+                }
+                return Err(format!(
+                    "Error: write failed for {}: {e}; rollback failed for {} of {} file(s) (disk may be partially modified): {}",
+                    p.path.display(),
+                    rb_err.len(),
+                    written.len(),
+                    rb_err.join("; ")
+                ));
+            }
+        }
+    }
+    Ok((written, rb_err))
+}
+
 pub fn run(args: Value) -> Result<String, String> {
     let a: Args = serde_json::from_value(args).map_err(|e| format!("Error: invalid apply_edits arguments (0 files modified): {e}"))?;
     if !(1..=50).contains(&a.edits.len()) {
@@ -333,7 +417,7 @@ pub fn run(args: Value) -> Result<String, String> {
     let cwd = cwd::resolve(a.cwd.as_deref())?;
     let mut jobs: Vec<Job> = Vec::new();
     for e in a.edits {
-        let path = canonical(&cwd.join(&e.path));
+        let path = cwd::canonical(&cwd.join(&e.path));
         match jobs.iter_mut().find(|j| cwd::key(&j.path) == cwd::key(&path)) {
             Some(j) => j.entries.push(e),
             None => jobs.push(Job { display: e.path.clone(), path, entries: vec![e] }),
@@ -361,35 +445,36 @@ pub fn run(args: Value) -> Result<String, String> {
     if a.dry_run {
         return Ok(format!("Dry run: {} file(s) valid (0 files modified):\n{}", plans.len(), summaries.join("\n")));
     }
-    let mut written: Vec<&Plan> = Vec::new();
-    for p in &plans {
-        match write_atomic(&p.path, &p.new, p.old.as_ref().map(|o| &o.1)) {
-            Ok(()) => written.push(p),
-            Err(e) if a.best_effort => failed.push(format!("{}: write failed: {e}", p.display)),
-            Err(e) => {
-                for w in &written {
-                    let _ = match &w.old {
-                        Some((bytes, perms)) => write_atomic(&w.path, bytes, Some(perms)),
-                        None => fs::remove_file(&w.path),
-                    };
-                }
-                return Err(format!("Error: write failed for {}: {e}; rolled back {} file(s) (0 files modified)", p.path.display(), written.len()));
-            }
-        }
-    }
+    let (written, rb_err) = commit(&plans, a.best_effort, &mut failed)?;
     drop(locks);
     let lines: Vec<&str> = written.iter().map(|p| p.summary.as_str()).collect();
     if written.is_empty() {
-        return Err(bullets("Error: every write failed (0 files modified):", &failed, budget::CAP));
+        let hdr = if rb_err.is_empty() {
+            "Error: every write failed (0 files modified):"
+        } else {
+            "Error: every write failed (rollback also failed; disk may be partially modified):"
+        };
+        return Err(bullets(hdr, &failed, budget::CAP));
     }
     if !failed.is_empty() {
-        let head = format!(
-            "Partial edit applied ({}/{} file(s) written; {} not written, left unchanged).\nWritten:\n{}",
-            written.len(),
-            jobs.len(),
-            failed.len(),
-            lines.join("\n")
-        );
+        let head = if rb_err.is_empty() {
+            format!(
+                "Partial edit applied ({}/{} file(s) written; {} not written, left unchanged).\nWritten:\n{}",
+                written.len(),
+                jobs.len(),
+                failed.len(),
+                lines.join("\n")
+            )
+        } else {
+            format!(
+                "Partial edit applied ({}/{} file(s) written; {} failed, rollback failed for {} — disk may be partially modified).\nWritten:\n{}",
+                written.len(),
+                jobs.len(),
+                failed.len(),
+                rb_err.len(),
+                lines.join("\n")
+            )
+        };
         let tail = if a.verify.is_some() { "\nVerify skipped: not every file was applied." } else { "" };
         let rest = bullets("Not written:", &failed, budget::CAP.saturating_sub(head.len() + tail.len() + 1));
         return Ok(format!("{head}\n{rest}{tail}"));
@@ -427,6 +512,22 @@ mod tests {
     }
 
     const DUP: &str = "fn one() {\n  return value;\n}\nfn two() {\n  return value;\n}\n";
+
+    #[test]
+    fn overlapping_matches_and_mixed_line_endings() {
+        let d = setup(&[("a", "aaa"), ("mixed", "a\r\nb\r\na\nb\nlast")]);
+        let h = |path, target, replacement, all| json!({"edits": [{"path": path, "hunks": [
+            {"target": target, "replacement": replacement, "replaceAll": all}
+        ]}]});
+        assert!(edit(&d, h("a", "aa", "X", false)).unwrap_err().contains("overlapping matches"));
+        assert_eq!(read(&d, "a"), "aaa");
+        edit(&d, h("a", "aa", "X", true)).unwrap();
+        assert_eq!(read(&d, "a"), "Xa");
+        assert!(edit(&d, h("mixed", "a\nb", "X\nY", false)).unwrap_err().contains("matched 2 times"));
+        edit(&d, h("mixed", "a\nb", "X\nY", true)).unwrap();
+        edit(&d, h("mixed", "last", "last\nline", false)).unwrap();
+        assert_eq!(read(&d, "mixed"), "X\r\nY\r\nX\nY\nlast\nline");
+    }
 
     #[test]
     fn unique_ambiguous_missing_and_window() {
@@ -536,5 +637,71 @@ mod tests {
             symlink(d.path().join("nowhere"), d.path().join("dangling")).unwrap();
             assert!(edit(&d, json!({"edits": [{"path": "dangling", "create": "x"}]})).unwrap_err().contains("dangling"));
         }
+        #[cfg(windows)]
+        {
+            let p = d.path().join("ro.txt");
+            fs::write(&p, "old\n").unwrap();
+            let mut ro = fs::metadata(&p).unwrap().permissions();
+            ro.set_readonly(true);
+            fs::set_permissions(&p, ro).unwrap();
+            edit(&d, json!({"edits": [{"path": "ro.txt", "hunks": [{"target": "old", "replacement": "new"}]}]})).unwrap();
+            assert_eq!(read(&d, "ro.txt"), "new\n");
+            let mut pms = fs::metadata(&p).unwrap().permissions();
+            assert!(pms.readonly(), "ReadOnly attribute was lost after edit");
+            #[allow(clippy::permissions_set_readonly_false)]
+            pms.set_readonly(false);
+            fs::set_permissions(&p, pms).unwrap();
+        }
+    }
+
+    #[test]
+    fn mixed_crlf_lf_hunk_edits_lf_block() {
+        let d = setup(&[("mix.txt", "head\r\nline1\nline2\ntail\r\n")]);
+        edit(&d, json!({"edits": [{"path": "mix.txt", "hunks": [{"target": "line1\nline2", "replacement": "L1\nL2\nL3"}]}]})).unwrap();
+        assert_eq!(read(&d, "mix.txt"), "head\r\nL1\nL2\nL3\ntail\r\n");
+    }
+
+    #[test]
+    fn mid_batch_write_failure_rolls_back_and_reports_rollback_errors() {
+        let d = setup(&[("a.txt", "old\n")]);
+        let a_path = d.path().join("a.txt");
+        #[cfg(windows)]
+        fs::write(d.path().join("a.txt:rollback"), "kept").unwrap();
+        let a_perms = fs::metadata(&a_path).unwrap().permissions();
+        let created = d.path().join("new.txt");
+        let blocker = d.path().join("blocker");
+        fs::create_dir(&blocker).unwrap();
+        let plans = vec![
+            Plan { display: "a.txt".into(), path: a_path.clone(), new: b"new\n".to_vec(), old: Some((b"old\n".to_vec(), a_perms)), summary: String::new() },
+            Plan { display: "new.txt".into(), path: created.clone(), new: b"hi\n".to_vec(), old: None, summary: String::new() },
+            Plan { display: "blocker".into(), path: blocker.clone(), new: b"x".to_vec(), old: None, summary: String::new() },
+        ];
+        let err = commit(&plans, false, &mut Vec::new()).err().unwrap();
+        assert!(err.contains("rolled back 2 file(s) (0 files modified)"), "{err}");
+        assert_eq!(read(&d, "a.txt"), "old\n");
+        assert!(!created.exists());
+        #[cfg(windows)]
+        assert_eq!(read(&d, "a.txt:rollback"), "kept");
+
+        // Duplicate created path forces second rollback's remove_file to fail.
+        let dup = d.path().join("dup.txt");
+        let rb_plans = vec![
+            Plan { display: "dup.txt".into(), path: dup.clone(), new: b"1".to_vec(), old: None, summary: String::new() },
+            Plan { display: "dup.txt".into(), path: dup, new: b"2".to_vec(), old: None, summary: String::new() },
+            Plan { display: "blocker".into(), path: blocker, new: b"x".to_vec(), old: None, summary: String::new() },
+        ];
+        let rb_err = commit(&rb_plans, false, &mut Vec::new()).err().unwrap();
+        assert!(rb_err.contains("rollback failed") && rb_err.contains("dup.txt"), "{rb_err}");
+        assert!(!rb_err.contains("0 files modified") && !rb_err.contains("left unchanged"), "{rb_err}");
+    }
+
+    #[test]
+    fn post_edit_verify_reports_pass_and_fail() {
+        let d = setup(&[("v.txt", "one\n")]);
+        let pass = edit(&d, json!({"edits": [{"path": "v.txt", "hunks": [{"target": "one", "replacement": "two"}]}], "verify": "echo verify-ok"})).unwrap();
+        assert!(pass.contains("v.txt: updated") && pass.contains("PASS"), "{pass}");
+        let fail = edit(&d, json!({"edits": [{"path": "v.txt", "hunks": [{"target": "two", "replacement": "three"}]}], "verify": "exit 1"})).unwrap();
+        assert!(fail.contains("v.txt: updated") && fail.contains("FAIL"), "{fail}");
+        assert_eq!(read(&d, "v.txt"), "three\n");
     }
 }

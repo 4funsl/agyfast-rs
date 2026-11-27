@@ -83,3 +83,42 @@ fn concurrent_cli_edits_lose_nothing() {
     let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
     assert_eq!(leftovers.len(), 1, "temp files left behind: {leftovers:?}");
 }
+
+#[test]
+fn concurrent_two_file_reverse_order_edits_do_not_deadlock() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.txt");
+    let b = dir.path().join("b.txt");
+    let init: String = (0..WORKERS).map(|i| format!("{}\n", marker(i, "pending"))).collect();
+    std::fs::write(&a, &init).unwrap();
+    std::fs::write(&b, &init).unwrap();
+
+    let mut children: Vec<_> = (0..WORKERS)
+        .map(|_| {
+            Command::new(env!("CARGO_BIN_EXE_agyfast-rs"))
+                .args(["cli", "edit", "--cwd", dir.path().to_str().unwrap(), "--stdin"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    let payloads: Vec<String> = (0..WORKERS)
+        .map(|i| {
+            let (first, second) = if i % 2 == 0 { ("a.txt", "b.txt") } else { ("b.txt", "a.txt") };
+            let h = serde_json::json!([{"target": marker(i, "pending"), "replacement": marker(i, "edited")}]);
+            serde_json::json!({"edits": [{"path": first, "hunks": h}, {"path": second, "hunks": h}]}).to_string()
+        })
+        .collect();
+    for (child, payload) in children.iter_mut().zip(&payloads) {
+        child.stdin.take().unwrap().write_all(payload.as_bytes()).unwrap();
+    }
+    for (i, child) in children.into_iter().enumerate() {
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "worker {i} failed: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    }
+    let expected: String = (0..WORKERS).map(|i| format!("{}\n", marker(i, "edited"))).collect();
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), expected);
+    assert_eq!(std::fs::read_to_string(&b).unwrap(), expected);
+}

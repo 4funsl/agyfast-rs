@@ -21,8 +21,10 @@ done
 mkdir -p "$plugin_dir/rules"
 install -m 0644 plugin/rules/AGENTS.md "$plugin_dir/rules/AGENTS.md"
 # Write to a temp name then rename, so a running MCP server is never overwritten in place.
-install -m 0755 "$bin" "$plugin_dir/bin/agyfast-rs.new" && mv -f "$plugin_dir/bin/agyfast-rs.new" "$plugin_dir/bin/agyfast-rs"
-install -m 0755 "$bin" "$cli_dir/agyfast-rs.new" && mv -f "$cli_dir/agyfast-rs.new" "$cli_dir/agyfast-rs"
+install -m 0755 "$bin" "$plugin_dir/bin/agyfast-rs.new"
+mv -f "$plugin_dir/bin/agyfast-rs.new" "$plugin_dir/bin/agyfast-rs"
+install -m 0755 "$bin" "$cli_dir/agyfast-rs.new"
+mv -f "$cli_dir/agyfast-rs.new" "$cli_dir/agyfast-rs"
 
 echo "Installed plugin: $plugin_dir"
 echo "Installed CLI:    $cli_dir/agyfast-rs (make sure $cli_dir is on PATH)"

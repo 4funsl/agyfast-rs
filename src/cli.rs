@@ -14,6 +14,7 @@ const HELP: &str = r#"agyfast-rs cli <tool> [--cwd DIR] [--max-chars N] [--json 
   slices   [--outline FILE]... FILE:START-END[,START-END]...
   edit     [--best-effort] [--dry-run] [--verify CMD] [--verify-timeout S] [--max-verify-chars N] --stdin   ({"edits":[...]} on stdin)
   check    [--compact|--full] [--concurrency N] [--timeout S] "CMD"...
+           A completed check report exits 0 even when a child fails. Failed checks report their own status.
   filter   "CMD"   compress CMD's output read from stdin (runs nothing); first line [agyfast-rs PASS|FAIL],
                    exit 1 when the output shows failure (used by `agyfast-rs hook pre-bash`)
   snapshot
@@ -42,6 +43,7 @@ fn worker_brief() -> Result<String, String> {
 }
 
 fn object(text: &str) -> Result<Map<String, Value>, String> {
+    let text = text.trim_start_matches('\u{feff}');
     match serde_json::from_str(text) {
         Ok(Value::Object(m)) => Ok(m),
         Ok(_) => Err("Error: expected a JSON object of tool arguments".into()),
@@ -97,8 +99,17 @@ fn build(tool: &str, args: &[String]) -> Result<Value, String> {
                 items.push(q.into());
             }
             flag if flag.starts_with("--") => return Err(format!("Error: unknown flag {flag}\n{HELP}")),
+            positional if tool == "batch_search" => {
+                let mut q = std::mem::take(&mut query);
+                q.entry("type").or_insert("text".into());
+                q.insert("pattern".into(), positional.into());
+                items.push(q.into());
+            }
             positional => items.push(positional.into()),
         }
+    }
+    if !query.is_empty() {
+        return Err("Error: search modifiers (--path, --definition, etc.) must appear before a search query, not after all queries or on another tool".into());
     }
     let mut set = |key: &str, list: Vec<Value>| {
         if !list.is_empty() {
@@ -106,10 +117,7 @@ fn build(tool: &str, args: &[String]) -> Result<Value, String> {
         }
     };
     match tool {
-        "batch_search" => set(
-            "queries",
-            items.into_iter().map(|q| if q.is_string() { json!({"type": "text", "pattern": q}) } else { q }).collect(),
-        ),
+        "batch_search" => set("queries", items),
         "quick_outline" => set("paths", items),
         "read_slices" => {
             set("lineRanges", items);
@@ -119,6 +127,59 @@ fn build(tool: &str, args: &[String]) -> Result<Value, String> {
         _ => {}
     }
     Ok(top.into())
+}
+
+const FILTER_HEAD: usize = 1 << 20;
+const FILTER_TAIL: usize = 15 << 20;
+
+/// Read `r` to EOF, keeping the first 1 MiB and last 15 MiB when total > 16 MiB.
+fn read_bounded(mut r: impl Read) -> std::io::Result<Vec<u8>> {
+    let (mut head, mut tail, mut tail_pos, mut total) = (Vec::new(), Vec::new(), 0usize, 0usize);
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        total += n;
+        let mut s = &buf[..n];
+        if head.len() < FILTER_HEAD {
+            let take = (FILTER_HEAD - head.len()).min(s.len());
+            head.extend_from_slice(&s[..take]);
+            s = &s[take..];
+        }
+        if !s.is_empty() {
+            if tail.len() < FILTER_TAIL {
+                let take = (FILTER_TAIL - tail.len()).min(s.len());
+                tail.extend_from_slice(&s[..take]);
+                let rem = &s[take..];
+                if !rem.is_empty() {
+                    let first = FILTER_TAIL.min(rem.len());
+                    tail[..first].copy_from_slice(&rem[..first]);
+                    tail_pos = first % FILTER_TAIL;
+                }
+            } else {
+                let first = (FILTER_TAIL - tail_pos).min(s.len());
+                tail[tail_pos..tail_pos + first].copy_from_slice(&s[..first]);
+                let rem = &s[first..];
+                if !rem.is_empty() {
+                    tail[..rem.len()].copy_from_slice(rem);
+                    tail_pos = rem.len();
+                } else {
+                    tail_pos = (tail_pos + first) % FILTER_TAIL;
+                }
+            }
+        }
+    }
+    if total <= FILTER_HEAD + FILTER_TAIL {
+        head.extend_from_slice(&tail);
+        return Ok(head);
+    }
+    let omitted = total - (FILTER_HEAD + FILTER_TAIL);
+    head.extend_from_slice(format!("\n... [{omitted} bytes of output omitted] ...\n").as_bytes());
+    head.extend_from_slice(&tail[tail_pos..]);
+    head.extend_from_slice(&tail[..tail_pos]);
+    Ok(head)
 }
 
 pub fn run(args: &[String]) -> i32 {
@@ -141,18 +202,37 @@ pub fn run(args: &[String]) -> i32 {
             };
         }
         Some("filter") => {
-            let [_, command] = args else {
-                eprintln!("{HELP}");
-                return 2;
+            let (command, framed) = match args {
+                [_, command] => (command, false),
+                [_, flag, command] if flag == "--framed" => (command, true),
+                _ => {
+                    eprintln!("{HELP}");
+                    return 2;
+                }
             };
-            let mut raw = Vec::new();
-            if let Err(e) = std::io::stdin().read_to_end(&mut raw) {
-                eprintln!("Error: reading stdin: {e}");
-                return 1;
-            }
-            let (text, failed) = tools::check::filter(command, &String::from_utf8_lossy(&raw));
+            let raw = match read_bounded(std::io::stdin().lock()) {
+                Ok(raw) => raw,
+                Err(e) => {
+                    eprintln!("Error: reading stdin: {e}");
+                    return 1;
+                }
+            };
+            let (raw, status) = if framed {
+                let frame = raw.iter().rposition(|&b| b == 0).and_then(|i| {
+                    let code = std::str::from_utf8(&raw[i + 1..]).ok()?.parse::<u8>().ok()?;
+                    Some((&raw[..i], Some(code)))
+                });
+                let Some(frame) = frame else {
+                    eprintln!("Error: missing check exit status");
+                    return 1;
+                };
+                frame
+            } else {
+                (raw.as_slice(), None)
+            };
+            let (text, failed) = tools::check::filter(command, &String::from_utf8_lossy(raw), status);
             println!("{text}");
-            return i32::from(failed);
+            return i32::from(status.unwrap_or(u8::from(failed)));
         }
         Some("worker-brief") => {
             return match worker_brief() {
@@ -222,6 +302,9 @@ mod tests {
             build("apply_edits", &args(&["--json", r#"{"edits":[]}"#, "--best-effort"])).unwrap(),
             json!({"edits": [], "bestEffort": true})
         );
+        assert_eq!(object("\u{feff}{\"edits\":[]}").unwrap().get("edits"), Some(&json!([])));
+        assert_eq!(object("\u{feff}\u{feff}{\"edits\":[]}").unwrap().get("edits"), Some(&json!([])));
+        assert_eq!(build("apply_edits", &args(&["--json", "\u{feff}{\"edits\":[]}"])).unwrap(), json!({"edits": []}));
         assert!(build("run_checks", &args(&["--bogus"])).is_err());
         assert!(build("run_checks", &args(&["--timeout", "soon"])).is_err());
     }
@@ -239,5 +322,29 @@ mod tests {
     fn invoke_quotes_per_shell() {
         assert_eq!(invoke(r"C:\Users\o'k\a.exe", true), r"& 'C:\Users\o''k\a.exe'");
         assert_eq!(invoke("/a b/x", false), "'/a b/x'");
+    }
+
+    #[test]
+    fn positional_search_inherits_modifiers_and_trailing_modifiers_error() {
+        assert_eq!(
+            build("batch_search", &args(&["--path", "src", "--definition", "foo"])).unwrap(),
+            json!({"queries": [{"type": "text", "pattern": "foo", "path": "src", "definition": true}]})
+        );
+        assert!(build("batch_search", &args(&["--text", "foo", "--path", "src"])).is_err());
+        assert!(build("quick_outline", &args(&["--path", "src", "a.rs"])).is_err());
+    }
+
+    #[test]
+    fn read_bounded_caps_over_16_mib() {
+        assert_eq!(read_bounded(std::io::Cursor::new(b"hello")).unwrap(), b"hello");
+        let mut input = vec![b'a'; FILTER_HEAD];
+        input.extend_from_slice(&[b'm'; 100]);
+        input.extend_from_slice(&vec![b'z'; FILTER_TAIL]);
+        let out = read_bounded(std::io::Cursor::new(input)).unwrap();
+        let marker = b"\n... [100 bytes of output omitted] ...\n";
+        assert_eq!(out.len(), FILTER_HEAD + marker.len() + FILTER_TAIL);
+        assert!(out.starts_with(&[b'a'; 16]));
+        assert_eq!(&out[FILTER_HEAD..FILTER_HEAD + marker.len()], marker);
+        assert!(out.ends_with(&[b'z'; 16]));
     }
 }

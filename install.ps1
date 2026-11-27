@@ -18,12 +18,22 @@ Copy-Item (Join-Path $root "plugin\plugin.json") $pluginDir -Force
 
 # A running MCP server locks its .exe: move the old one aside instead of overwriting it.
 function Install-Exe([string]$dest) {
-  if (Test-Path $dest) {
-    # Leftovers of earlier updates stay locked until Antigravity restarts: delete best-effort, move aside under a unique name.
-    Get-ChildItem "$dest.old*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-    Move-Item $dest "$dest.old.$PID.$(Get-Random)" -Force
+  $stage = "$dest.new.$PID"
+  $backup = "$dest.old.$PID.$(Get-Random)"
+  try {
+    Copy-Item -LiteralPath $bin -Destination $stage -Force
+    if (Test-Path -LiteralPath $dest) {
+      Get-ChildItem "$dest.old*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+      Move-Item -LiteralPath $dest -Destination $backup
+    }
+    try { Move-Item -LiteralPath $stage -Destination $dest }
+    catch {
+      if (Test-Path -LiteralPath $backup) { Move-Item -LiteralPath $backup -Destination $dest }
+      throw
+    }
+  } finally {
+    Remove-Item -LiteralPath $stage -Force -ErrorAction SilentlyContinue
   }
-  Copy-Item $bin $dest -Force
 }
 $pluginExe = Join-Path $pluginDir "bin\agyfast-rs.exe"
 Install-Exe $pluginExe
@@ -45,12 +55,12 @@ Write-Json (Join-Path $pluginDir "hooks.json") $hooks
 $rules = [IO.File]::ReadAllText((Join-Path $root "plugin\rules\AGENTS.md"))
 $posixCmd = '"$HOME/.gemini/config/plugins/agyfast-rs/bin/agyfast-rs" cli worker-brief'
 if (-not $rules.Contains($posixCmd)) { throw "plugin\rules\AGENTS.md no longer contains the worker-brief command; update install.ps1" }
-[IO.File]::WriteAllText((Join-Path $pluginDir "rules\AGENTS.md"), $rules.Replace($posixCmd, "& `"$pluginExe`" cli worker-brief"), (New-Object Text.UTF8Encoding $false))
+[IO.File]::WriteAllText((Join-Path $pluginDir "rules\AGENTS.md"), $rules.Replace($posixCmd, "& '$($pluginExe.Replace("'", "''"))' cli worker-brief"), (New-Object Text.UTF8Encoding $false))
 
 Write-Host "Installed plugin: $pluginDir"
 Write-Host "Installed CLI:    $cliDir\agyfast-rs.exe"
 if (-not (($env:PATH -split ';') -contains $cliDir)) { Write-Host "Add $cliDir to PATH to call agyfast-rs from a terminal." }
-$gitSh = @("usr\bin", "bin") | ForEach-Object { Join-Path $env:ProgramFiles "Git\$_\sh.exe" } | Where-Object { Test-Path $_ }
+$gitSh = @("bin", "usr\bin") | ForEach-Object { Join-Path $env:ProgramFiles "Git\$_\sh.exe" } | Where-Object { Test-Path $_ }
 if (-not (Get-Command sh -ErrorAction SilentlyContinue) -and -not $gitSh) {
   Write-Warning "sh was not found (not on PATH, not in Git for Windows). run_checks and apply_edits' verify will run commands through cmd.exe, where POSIX shell syntax (quotes, &&, pipes to sh tools) may not work: install Git for Windows."
 }

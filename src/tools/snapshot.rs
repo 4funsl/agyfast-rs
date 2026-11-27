@@ -4,20 +4,22 @@ use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wait_timeout::ChildExt;
 
 const MAX_BYTES: usize = 1500;
 const MAX_STDIN: usize = 256 * 1024;
 const GIT_TIMEOUT: Duration = Duration::from_millis(800);
+const GIT_CAP: usize = 64 * 1024;
 const SKIP_DIRS: &[&str] = &["node_modules", "target", "dist", "build", "out", "venv", "__pycache__", "vendor"];
 
 fn git_child(cwd: &Path, args: &[&str]) -> Option<std::process::Child> {
     Command::new("git")
-        .args(["--no-optional-locks", "-c", "core.quotePath=false", "--no-pager"])
+        .args(["--no-optional-locks", "-c", "core.quotePath=false", "-c", "core.fsmonitor=false", "--no-pager"])
         .args(args)
         .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -25,16 +27,39 @@ fn git_child(cwd: &Path, args: &[&str]) -> Option<std::process::Child> {
         .ok()
 }
 
-fn git_finish(child: Option<std::process::Child>) -> Option<String> {
+struct RunningGit {
+    child: std::process::Child,
+    reader: std::thread::JoinHandle<Vec<u8>>,
+}
+
+fn git_start(child: Option<std::process::Child>) -> Option<RunningGit> {
     let mut child = child?;
     let mut out = child.stdout.take()?;
     let reader = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = out.by_ref().take(64 * 1024).read_to_string(&mut s);
-        s
+        let mut buf = Vec::new();
+        let _ = out.by_ref().take(GIT_CAP as u64 + 1).read_to_end(&mut buf);
+        buf
     });
-    match child.wait_timeout(GIT_TIMEOUT) {
-        Ok(Some(st)) if st.success() => reader.join().ok(),
+    Some(RunningGit { child, reader })
+}
+
+fn git_finish(running: Option<RunningGit>, deadline: Instant) -> Option<(String, bool)> {
+    let RunningGit { mut child, reader } = running?;
+    let rem = deadline.saturating_duration_since(Instant::now());
+    match child.wait_timeout(rem) {
+        Ok(Some(st)) => {
+            let mut buf = reader.join().ok()?;
+            let truncated = buf.len() > GIT_CAP;
+            if truncated {
+                let complete = buf[..GIT_CAP].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+                buf.truncate(complete);
+            }
+            if st.success() || truncated {
+                Some((String::from_utf8_lossy(&buf).into_owned(), truncated))
+            } else {
+                None
+            }
+        }
         _ => {
             let _ = child.kill();
             let _ = child.wait();
@@ -46,14 +71,15 @@ fn git_finish(child: Option<std::process::Child>) -> Option<String> {
 /// Branch, dirty/untracked counts and the last commit subjects; `None` outside a repo.
 fn git_section(cwd: &Path) -> Option<String> {
     cwd.ancestors().find(|d| d.join(".git").exists())?;
-    // Both git processes run concurrently.
-    let status = git_child(cwd, &["status", "--porcelain=v1", "--branch"]);
-    let log = git_child(cwd, &["log", "-n", "3", "--format=%h %s"]);
-    let status = git_finish(status);
-    let log = git_finish(log);
+    // Both git processes and their stdout readers run concurrently under one deadline.
+    let status = git_start(git_child(cwd, &["status", "--porcelain=v1", "--branch"]));
+    let log = git_start(git_child(cwd, &["log", "-n", "3", "--format=%h %s"]));
+    let deadline = Instant::now() + GIT_TIMEOUT;
+    let status = git_finish(status, deadline);
+    let log = git_finish(log, deadline);
     let mut text = String::from("Git: ");
     match status {
-        Some(s) => {
+        Some((s, truncated)) if !s.is_empty() => {
             let mut lines = s.lines();
             let head = lines.next().unwrap_or("").trim_start_matches("## ");
             let branch = head.split("...").next().unwrap_or(head);
@@ -62,11 +88,12 @@ fn git_section(cwd: &Path) -> Option<String> {
             for l in lines {
                 if l.starts_with("??") { untracked += 1 } else if !l.trim().is_empty() { dirty += 1 }
             }
-            text += &format!("branch `{branch}`, {dirty} dirty, {untracked} untracked");
+            let bound = if truncated { "+" } else { "" };
+            text += &format!("branch `{branch}`, {dirty}{bound} dirty, {untracked}{bound} untracked");
         }
-        None => text += "status unavailable",
+        _ => text += "status unavailable",
     }
-    for l in log.iter().flat_map(|l| l.lines()) {
+    for l in log.iter().flat_map(|(text, _)| text.lines()) {
         text += &format!("\n  - {}", fold(l, 72));
     }
     Some(text)
@@ -110,7 +137,7 @@ fn tree(cwd: &Path) -> String {
     let walk = ignore::WalkBuilder::new(cwd)
         .max_depth(Some(2))
         .require_git(false)
-        .filter_entry(|e| !(e.file_type().is_some_and(|t| t.is_dir()) && SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref())))
+        .filter_entry(|e| e.depth() == 0 || !(e.file_type().is_some_and(|t| t.is_dir()) && SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref())))
         .build();
     let mut top: BTreeMap<String, (bool, Vec<String>)> = BTreeMap::new();
     for e in walk.flatten().filter(|e| e.depth() > 0) {
@@ -157,6 +184,13 @@ pub fn snapshot(cwd: &Path) -> String {
     fold(&parts.join("\n"), MAX_BYTES)
 }
 
+fn strip_bom(mut bytes: &[u8]) -> &[u8] {
+    while let Some(rest) = bytes.strip_prefix(b"\xef\xbb\xbf") {
+        bytes = rest;
+    }
+    bytes
+}
+
 fn read_payload() -> Option<Value> {
     if std::io::stdin().is_terminal() {
         return None;
@@ -168,11 +202,11 @@ fn read_payload() -> Option<Value> {
         let mut stdin = std::io::stdin().lock();
         while let Ok(n) = stdin.read(&mut chunk) {
             buf.extend_from_slice(&chunk[..n]);
-            if n == 0 || buf.len() >= MAX_STDIN || serde_json::from_slice::<Value>(&buf).is_ok() {
+            if n == 0 || buf.len() >= MAX_STDIN || serde_json::from_slice::<Value>(strip_bom(&buf)).is_ok() {
                 break;
             }
         }
-        let _ = tx.send(serde_json::from_slice::<Value>(&buf).ok());
+        let _ = tx.send(serde_json::from_slice::<Value>(strip_bom(&buf)).ok());
     });
     rx.recv_timeout(Duration::from_millis(1500)).ok().flatten()
 }
@@ -203,7 +237,7 @@ fn response(payload: &Value, text: &str) -> Value {
 pub fn hook() {
     let out = read_payload()
         .and_then(|p| {
-            let text = snapshot(&workspace_dir(&p)?.canonicalize().ok()?);
+            let text = snapshot(&crate::core::cwd::simplify(workspace_dir(&p)?.canonicalize().ok()?));
             (!text.is_empty()).then(|| response(&p, &text))
         })
         .unwrap_or_else(|| json!({}));
@@ -284,5 +318,36 @@ mod tests {
         assert_eq!(workspace_dir(&agy).unwrap(), d.path());
         assert_eq!(response(&agy, "t")["injectSteps"][0]["systemMessage"]["systemMessage"], "t");
         assert!(workspace_dir(&json!({"cwd": "/definitely/not/here"})).is_none());
+        assert!(serde_json::from_slice::<Value>(strip_bom(b"\xef\xbb\xbf\xef\xbb\xbf{\"cwd\":\"/x\"}")).is_ok());
+        assert_eq!(strip_bom(b"{\"a\":1}"), b"{\"a\":1}");
+    }
+
+    #[test]
+    fn tree_works_when_workspace_dir_is_named_build() {
+        let d = dir();
+        let root = d.path().join("build");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "").unwrap();
+        assert!(tree(&root).contains("src/ (1): a.rs"));
+    }
+
+    #[test]
+    fn git_finish_caps_at_64k_and_decodes_non_utf8() {
+        let d = dir();
+        let p = d.path();
+        assert!(Command::new("git").args(["init", "-q"]).current_dir(p).output().unwrap().status.success());
+        let mut raw = vec![b'a'; 70 * 1024];
+        raw[0] = 0xff;
+        raw[1] = 0xfe;
+        raw[GIT_CAP - 3] = b'\n';
+        std::fs::write(p.join("blob.bin"), &raw).unwrap();
+        let hash = Command::new("git").args(["hash-object", "-w", "blob.bin"]).current_dir(p).output().unwrap();
+        assert!(hash.status.success());
+        let hash = String::from_utf8(hash.stdout).unwrap();
+        let running = git_start(git_child(p, &["cat-file", "blob", hash.trim()]));
+        let (out, truncated) = git_finish(running, Instant::now() + GIT_TIMEOUT).unwrap();
+        assert!(truncated && out.ends_with('\n'));
+        assert_eq!(out.len(), GIT_CAP + 2); // drop two partial bytes, gain four decoding invalid UTF-8
+        assert!(out.starts_with("\u{FFFD}\u{FFFD}aaa"));
     }
 }

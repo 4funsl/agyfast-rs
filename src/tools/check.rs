@@ -103,15 +103,18 @@ pub fn run(args: Value) -> Result<String, String> {
         })
         .collect::<Result<Vec<_>, String>>()?;
 
-    let threads = a.concurrency.unwrap_or(DEFAULT_CONCURRENCY).clamp(1, 8);
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build()
-        .map_err(|e| format!("Error: cannot start worker threads: {e}"))?;
+    let threads = a.concurrency.unwrap_or(DEFAULT_CONCURRENCY).clamp(1, 8).min(jobs.len());
     let start = Instant::now();
-    // with_max_len(1): every command is its own stealable job, so a long one never queues others behind it.
-    let runs: Vec<Run> =
-        pool.install(|| jobs.par_iter().with_max_len(1).map(|(_, cmd, dir, t)| execute(cmd, dir, *t)).collect());
+    let runs: Vec<Run> = if threads == 1 {
+        jobs.iter().map(|(_, cmd, dir, t)| execute(cmd, dir, *t)).collect()
+    } else {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .map_err(|e| format!("Error: cannot start worker threads: {e}"))?;
+        // with_max_len(1): every command is its own stealable job, so a long one never queues others behind it.
+        pool.install(|| jobs.par_iter().with_max_len(1).map(|(_, cmd, dir, t)| execute(cmd, dir, *t)).collect())
+    };
 
     let passed = runs.iter().filter(|r| r.status == Status::Pass).count();
     let mut head = format!("Checks: {passed}/{} passed", runs.len());
@@ -134,8 +137,15 @@ pub fn run(args: Value) -> Result<String, String> {
             top + &body
         }
     };
-    let lens: Vec<usize> = (0..=runs.len()).map(|i| part(i, usize::MAX).len()).collect();
-    Ok(budget::join_fair_by(&lens, budget::limit(a.max_chars, 500), |i, share| budget::fold(&part(i, share), share)))
+    let mut full_parts: Vec<String> = (0..=runs.len()).map(|i| part(i, usize::MAX)).collect();
+    let lens: Vec<usize> = full_parts.iter().map(String::len).collect();
+    Ok(budget::join_fair_by(&lens, budget::limit(a.max_chars, 500), |i, share| {
+        if full_parts[i].len() <= share {
+            std::mem::take(&mut full_parts[i])
+        } else {
+            budget::fold(&part(i, share), share)
+        }
+    }))
 }
 
 /// Run one verify command for `apply_edits` and return its compressed report,
@@ -234,26 +244,33 @@ enum Step<'a> {
 /// shell: anything but top-level `&&` between simple commands (see `and_parts`),
 /// or a step that changes shell state other than a plain `cd DIR`.
 fn split_chain(command: &str) -> Option<Vec<Step<'_>>> {
-    chain_steps(and_parts(command, false).filter(|p| p.len() >= 2)?)
+    #[cfg(windows)]
+    if command.contains('^') && !(needs_sh(command) && find_sh().is_some()) {
+        return None;
+    }
+    chain_steps(and_parts(command, false).filter(|p| p.len() >= 2)?, cfg!(windows))
 }
 
-fn chain_steps(parts: Vec<&str>) -> Option<Vec<Step<'_>>> {
+fn chain_steps(parts: Vec<&str>, win: bool) -> Option<Vec<Step<'_>>> {
     const STATEFUL: &[&str] = &[
         "export", "source", ".", "set", "unset", "alias", "unalias", "shopt", "umask", "pushd", "popd", "eval", "exec",
-        "trap", "ulimit", "readonly", "declare", "typeset", "local", "hash", "shift",
+        "trap", "ulimit", "readonly", "declare", "typeset", "local", "hash", "shift", "exit", "return", "builtin", "command",
     ];
+    let eq = |a: &str, b: &str| if win { a.eq_ignore_ascii_case(b) } else { a == b };
     parts
         .into_iter()
         .map(|p| {
             let w = words(p);
             let i = program(&w);
-            match w.get(i)?.1 {
-                "cd" if i == 0 && w.len() == 2 && !w[1].1.starts_with(['-', '~']) && !w[1].1.contains('$') => {
-                    Some(Step::Cd(w[1].1.trim_matches(['\'', '"'])))
-                }
-                "cd" => None,
-                prog if STATEFUL.contains(&prog) => None,
-                _ => Some(Step::Run(p)),
+            let prog = w.get(i)?.1;
+            if eq(prog, "cd") {
+                let dir = w.get(1).filter(|_| i == 0 && w.len() == 2)?.1;
+                (!(dir.starts_with(['-', '~']) || dir.contains(['$', '*', '?']) || (win && dir.contains('%'))))
+                    .then(|| Step::Cd(dir.trim_matches(['\'', '"'])))
+            } else if prog.contains(['\'', '"', '$', '%']) || STATEFUL.iter().any(|&s| eq(prog, s)) {
+                None
+            } else {
+                Some(Step::Run(p))
             }
         })
         .collect()
@@ -307,13 +324,15 @@ fn and_parts(command: &str, allow_merge: bool) -> Option<Vec<&str>> {
     quote.is_none().then_some(parts)
 }
 
+fn is_win_path_next(b: Option<&u8>) -> bool {
+    b.is_some_and(|n| !n.is_ascii() || n.is_ascii_alphanumeric() || b"._-*".contains(n))
+}
+
 /// Whether `s` has a backslash that may escape something. With `win`, one before
 /// a path character (`crates\foo`, `.\x`, `sub\*.rs`) is a separator instead.
 fn escapes(s: &str, win: bool) -> bool {
     let b = s.as_bytes();
-    (0..b.len()).any(|i| {
-        b[i] == b'\\' && !(win && b.get(i + 1).is_some_and(|n| n.is_ascii_alphanumeric() || b"._-*".contains(n)))
-    })
+    (0..b.len()).any(|i| b[i] == b'\\' && !(win && is_win_path_next(b.get(i + 1))))
 }
 
 /// Single-quote `s` for a POSIX shell.
@@ -333,7 +352,7 @@ fn filterable(step: &str) -> bool {
 }
 
 /// `command` with each filterable step of a plain command or `&&` chain turned
-/// into `STEP 2>&1 | EXE cli filter 'STEP'` (cargo builds get JSON diagnostics);
+/// into a pipeline carrying output and a NUL-delimited exit code (cargo builds get JSON diagnostics);
 /// other steps stay as written. A trailing `2>&1` on a step is dropped (the
 /// rewrite adds its own); any other redirection or pipe leaves the command alone.
 /// `None` when nothing would change.
@@ -341,7 +360,7 @@ fn rewrite(command: &str, exe: &str) -> Option<String> {
     let command = command.trim();
     let parts = and_parts(command, true).filter(|_| !command.contains("agyfast-rs"))?;
     if parts.len() > 1 {
-        chain_steps(parts.clone())?;
+        chain_steps(parts.clone(), cfg!(windows))?;
     }
     // Unquoted when it needs no quotes, so the allow rule is the same text however the host tokenises it.
     let exe = if exe.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-+".contains(&b)) { exe.to_string() } else { sh_quote(exe) };
@@ -350,7 +369,7 @@ fn rewrite(command: &str, exe: &str) -> Option<String> {
         .map(|&p| match filterable(p) {
             true => {
                 let p = p.strip_suffix("2>&1").map_or(p, str::trim_end);
-                format!("{} 2>&1 | {exe} cli filter {}", inject_json(p).as_deref().unwrap_or(p), sh_quote(p))
+                format!(r#"{{ if {}; then printf '\0%s' 0; else printf '\0%s' "$?"; fi; }} 2>&1 | {exe} cli filter --framed {}"#, inject_json(p).as_deref().unwrap_or(p), sh_quote(p))
             }
             false => p.to_string(),
         })
@@ -361,7 +380,7 @@ fn rewrite(command: &str, exe: &str) -> Option<String> {
 /// Claude Code `PreToolUse` response rewriting a Bash call, or `None` to leave
 /// it alone (any unexpected shape included). Never sets `permissionDecision`.
 fn pre_bash(payload: &str, exe: &str) -> Option<Value> {
-    let p: Value = serde_json::from_str(payload).ok()?;
+    let p: Value = serde_json::from_str(payload.trim_start_matches('\u{feff}')).ok()?;
     if p["tool_name"] != "Bash" {
         return None;
     }
@@ -386,17 +405,16 @@ pub fn pre_bash_hook() {
 }
 
 /// `agyfast-rs cli filter`: compress `raw`, the captured output of `command`, under a
-/// status line; `true` when the output shows failure. The exit code is lost in
-/// the pipe, so failure is read from the content.
-pub fn filter(command: &str, raw: &str) -> (String, bool) {
+/// status line. A hook supplies the child status; a manual pipeline uses output heuristics.
+pub fn filter(command: &str, raw: &str, status: Option<u8>) -> (String, bool) {
     let (k, out) = (kind(command), clean(raw));
-    let failed = failed(k, &out);
+    let failed = status.map(|s| s != 0).or_else(|| failed(k, &out));
     let text = match failed {
         None => format!("[agyfast-rs] {command} (status not judged)\n{}", generic(&out)),
         Some(false) => format!("[agyfast-rs PASS] {command}: {}", summary(&compress(k, &out, budget::CAP))),
         Some(true) => {
             let top = format!("[agyfast-rs FAIL] {command}\n");
-            let body = compress(k, &out, budget::CAP - top.len());
+            let body = compress(k, &out, budget::CAP.saturating_sub(top.len()));
             top + if body.trim().is_empty() { "(no output)" } else { &body }
         }
     };
@@ -406,24 +424,36 @@ pub fn filter(command: &str, raw: &str) -> (String, bool) {
 /// Whether output of this kind shows failure; `None` when the kind gives no verdict.
 fn failed(kind: Kind, out: &str) -> Option<bool> {
     let error_line = |l: &str| l.starts_with("error:") || l.starts_with("error[");
+    let startup_err = |l: &str| {
+        l.contains("command not found")
+            || l.contains(": not found")
+            || l.contains("is not recognized as an internal or external command")
+            || l.starts_with("ERROR:")
+            || (l.starts_with("go: ") && (l.contains("not found") || l.contains("cannot find")))
+    };
+    let passing_line = |l: &str| {
+        l.ends_with(" ... ok") || ["--- PASS", "=== RUN"].iter().any(|p| l.starts_with(p)) || l.starts_with(['✓', '✔', '√'])
+    };
     // `5 failed`, `1 error`, `2 errors`: a non-zero count of failures.
     let counted = |l: &str| {
-        let w: Vec<&str> = l.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+        let w: Vec<&str> = l.split(|c: char| !c.is_alphanumeric() && c != '_').filter(|w| !w.is_empty()).collect();
         w.windows(2).any(|p| p[0].parse::<u64>().is_ok_and(|n| n > 0) && matches!(p[1], "failed" | "failures" | "error" | "errors"))
     };
     Some(match kind {
         Kind::Generic => return None,
-        // cargo's JSON stream ends with `build-finished`; without it (manifest errors) cargo's own `error:` lines decide.
+        // cargo's JSON stream ends with `build-finished`; without it (manifest or startup errors) error/missing-tool lines decide.
         Kind::Cargo => match out.lines().filter(|l| l.contains("\"build-finished\"")).filter_map(|l| serde_json::from_str::<Value>(l).ok()).next_back() {
             Some(v) => v["success"] == false,
-            None => out.lines().any(error_line),
+            None => out.lines().map(str::trim).any(|t| error_line(t) || startup_err(t)),
         },
         Kind::Tests | Kind::Lint => out.lines().map(str::trim).any(|t| {
-            error_line(t)
-                || t == "FAIL"
-                || ["test result: FAILED", "FAILED ", "FAIL ", "FAIL\t", "--- FAIL"].iter().any(|p| t.starts_with(p))
-                || t.contains("error TS")
-                || counted(t)
+            !passing_line(t)
+                && (error_line(t)
+                    || startup_err(t)
+                    || t == "FAIL"
+                    || ["test result: FAILED", "FAILED ", "FAIL ", "FAIL\t", "--- FAIL"].iter().any(|p| t.starts_with(p))
+                    || t.contains("error TS")
+                    || counted(t))
         }),
     })
 }
@@ -437,7 +467,16 @@ fn execute_chain(steps: &[Step], dir: &Path, timeout: u64) -> Run {
         match step {
             Step::Run(c) if status != Status::Pass => done.push((c.to_string(), None)),
             Step::Run(c) => {
-                let r = execute_one(c, &dir, timeout, deadline.saturating_duration_since(Instant::now()));
+                let rem = deadline.saturating_duration_since(Instant::now());
+                if rem.is_zero() {
+                    status = Status::Timeout;
+                    done.push((
+                        c.to_string(),
+                        Some(Run { status: Status::Timeout, ms: 0, out: String::new(), kind: kind(c), injected: false, timeout, steps: Vec::new() }),
+                    ));
+                    continue;
+                }
+                let r = execute_one(c, &dir, timeout, rem);
                 status = r.status.clone();
                 done.push((c.to_string(), Some(r)));
             }
@@ -489,24 +528,79 @@ fn shell(command: &str) -> Command {
     cmd
 }
 
-/// Git for Windows' `sh.exe` when there is one (commands are usually written
-/// for it), else `cmd.exe /D /S /C "command"`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn needs_sh(command: &str) -> bool {
+    const POSIX_CMD: &[&str] = &[
+        "true", "false", "sleep", "test", "[", "seq", "export", "source", ".", "unset", "if", "for", "while",
+        "until", "case", "sh", "bash", "env", "printf", "touch", "rm", "cp", "mv", "ls", "cat", "head", "tail",
+        "grep", "sed", "awk", "wc", "which", "pwd",
+    ];
+    let b = command.as_bytes();
+    let (mut segs, mut start, mut in_dq, mut i) = (Vec::new(), 0, false, 0);
+    while i < b.len() {
+        let c = b[i];
+        if c == b'"' {
+            in_dq = !in_dq;
+        } else if !in_dq {
+            match c {
+                b'\'' | b';' | b'$' | b'`' | b'{' | b'}' | b'\n' => return true,
+                b'\\' if !is_win_path_next(b.get(i + 1)) => return true,
+                b'/' if command[i..].starts_with("/dev/null") => return true,
+                b'|' | b'&' => {
+                    segs.push(&command[start..i]);
+                    if b.get(i + 1) == Some(&c) {
+                        i += 1;
+                    }
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    segs.push(&command[start..]);
+    segs.into_iter().any(|seg| {
+        seg.split_whitespace().next().is_some_and(|first| {
+            is_env_assign(first) || (!first.starts_with('"') && first.contains('/')) || POSIX_CMD.contains(&first)
+        })
+    })
+}
+
 #[cfg(windows)]
-fn shell(command: &str) -> Command {
-    use std::os::windows::process::CommandExt;
+fn find_sh() -> Option<&'static std::path::PathBuf> {
     use std::path::PathBuf;
     static SH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-    let sh = SH.get_or_init(|| {
+    SH.get_or_init(|| {
         let on_path = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).map(|d| d.join("sh.exe")).collect::<Vec<_>>());
         let git = std::env::var_os("ProgramFiles").map(|p| {
             let git = PathBuf::from(p).join("Git");
-            vec![git.join(r"usr\bin\sh.exe"), git.join(r"bin\sh.exe")]
+            vec![git.join(r"bin\sh.exe"), git.join(r"usr\bin\sh.exe")]
         });
         on_path.into_iter().chain(git).flatten().find(|p| p.is_file())
-    });
-    if let Some(sh) = sh {
+    })
+    .as_ref()
+}
+
+/// Windows runs plain commands directly via `cmd.exe` so `\` paths and NTSTATUS exit
+/// codes stay intact; commands using POSIX syntax or utilities use `sh.exe` if installed.
+#[cfg(windows)]
+fn shell(command: &str) -> Command {
+    use std::os::windows::process::CommandExt;
+    if needs_sh(command)
+        && let Some(sh) = find_sh()
+    {
         let mut cmd = Command::new(sh);
         cmd.arg("-c").arg(command);
+        if let Some(dir) = sh.parent() {
+            let cur = std::env::var_os("PATH").unwrap_or_default();
+            let mut paths: Vec<_> = std::env::split_paths(&cur).collect();
+            if !paths.iter().any(|p| cwd::key(p) == cwd::key(dir)) {
+                paths.push(dir.to_path_buf());
+                if let Ok(joined) = std::env::join_paths(paths) {
+                    cmd.env("PATH", joined);
+                }
+            }
+        }
         return cmd;
     }
     let mut cmd = Command::new(std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into()));
@@ -577,13 +671,13 @@ fn read_capped(f: &mut File) -> std::io::Result<String> {
     f.seek(SeekFrom::Start(0))?;
     let mut buf = Vec::new();
     if len <= READ_CAP {
-        f.read_to_end(&mut buf)?;
+        f.by_ref().take(READ_CAP).read_to_end(&mut buf)?;
     } else {
         // shortcut: runaway output keeps its first 1 MiB and last 15 MiB only; enough for any summary.
         f.by_ref().take(1 << 20).read_to_end(&mut buf)?;
         buf.extend_from_slice(format!("\n... [{} bytes of output omitted] ...\n", len - READ_CAP).as_bytes());
         f.seek(SeekFrom::Start(len - (READ_CAP - (1 << 20))))?;
-        f.read_to_end(&mut buf)?;
+        f.by_ref().take(READ_CAP - (1 << 20)).read_to_end(&mut buf)?;
     }
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
@@ -654,17 +748,18 @@ fn words(s: &str) -> Vec<(usize, &str)> {
     out
 }
 
+fn is_env_assign(w: &str) -> bool {
+    w.split_once('=').is_some_and(|(k, _)| !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+}
+
 /// Index of the real program word, past `VAR=value`, `env` and runner wrappers.
 fn program(w: &[(usize, &str)]) -> usize {
     let word = |i: usize| w.get(i).map_or("", |x| x.1);
     let mut i = 0;
     loop {
         let cur = word(i);
-        let assign = cur.split_once('=').is_some_and(|(k, _)| {
-            !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        });
         i += match (cur, word(i + 1)) {
-            _ if assign => 1,
+            _ if is_env_assign(cur) => 1,
             ("env" | "npx" | "bunx" | "pnpx" | "yarn", _) => 1,
             ("pnpm" | "bun", "exec" | "dlx" | "x") | ("uv" | "poetry" | "pipenv" | "hatch", "run") => 2,
             (p, "-m") if p.starts_with("python") => 2,
@@ -683,14 +778,55 @@ fn basename(word: &str) -> &str {
 
 /// Index of the cargo subcommand word when `w[i]` is `cargo`.
 fn cargo_sub(w: &[(usize, &str)], i: usize) -> Option<usize> {
-    (basename(w.get(i)?.1) == "cargo").then_some(())?;
-    (i + 1..w.len()).find(|&j| !w[j].1.starts_with(['+', '-']))
+    basename(w.get(i)?.1).eq_ignore_ascii_case("cargo").then_some(())?;
+    let mut j = i + 1;
+    while let Some(&(_, arg)) = w.get(j) {
+        if matches!(arg, "-C" | "--config" | "--color" | "-Z" | "--explain") {
+            j += 2;
+        } else if arg.starts_with(['+', '-']) {
+            j += 1;
+        } else {
+            return Some(j);
+        }
+    }
+    None
+}
+
+/// Slice of `command` after the last unquoted `&&` and before the first unquoted `|`.
+fn last_step(command: &str) -> &str {
+    let b = command.as_bytes();
+    let (mut start, mut pipe, mut quote, mut i) = (0, None, None, 0);
+    while i < b.len() {
+        let c = b[i];
+        match quote {
+            Some(b'"') if c == b'\\' && matches!(b.get(i + 1), Some(b'"' | b'\\')) => {
+                i += 2;
+                continue;
+            }
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None => match c {
+                b'\'' | b'"' => quote = Some(c),
+                b'&' if b.get(i + 1) == Some(&b'&') => {
+                    i += 2;
+                    start = i;
+                    pipe = None;
+                    continue;
+                }
+                b'|' => {
+                    pipe.get_or_insert(i);
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    &command[start..pipe.unwrap_or(command.len())]
 }
 
 /// Compressor for a command, judged by its last `&&` step before any pipe.
 fn kind(command: &str) -> Kind {
-    let step = command.rsplit("&&").next().unwrap_or("").split('|').next().unwrap_or("");
-    let w = words(step);
+    let w = words(last_step(command));
     let i = program(&w);
     let word = |j: usize| w.get(j).map_or("", |x| x.1);
     if let Some(j) = cargo_sub(&w, i) {
@@ -700,7 +836,7 @@ fn kind(command: &str) -> Kind {
             _ => Kind::Generic,
         };
     }
-    match (basename(word(i)), word(i + 1)) {
+    match (basename(word(i)).to_ascii_lowercase().as_str(), word(i + 1)) {
         ("pytest" | "py.test" | "vitest" | "jest", _) | ("go", "test") => Kind::Tests,
         ("tsc" | "vue-tsc" | "eslint" | "biome", _) => Kind::Lint,
         _ => Kind::Generic,
@@ -910,8 +1046,8 @@ fn compress_lint(out: &str) -> String {
         let lower = t.to_lowercase();
         let first = t.split_whitespace().next().unwrap_or("");
         let located = first.contains('.')
-            && first.split([':', '(']).nth(1).is_some_and(|n| n.starts_with(|c: char| c.is_ascii_digit()));
-        let file_header = !line.starts_with(char::is_whitespace) && !t.contains(' ') && t.contains('/') && t.contains('.');
+            && first.split([':', '(']).skip(1).any(|n| n.starts_with(|c: char| c.is_ascii_digit()));
+        let file_header = !line.starts_with(char::is_whitespace) && !t.contains(' ') && t.contains(['/', '\\']) && t.contains('.');
         !t.contains('│')
             && (located
                 || file_header
@@ -1288,6 +1424,8 @@ error: test failed, to rerun pass `--bin demo`"##;
             "cargo check && $(echo cargo) test",
             "true && { cargo test; }",
             "export RUST_LOG=1 && cargo test",
+            "exit 0 && cargo test",
+            "'exit' 0 && cargo test",
             "source env.sh && cargo test",
             ". env.sh && cargo test",
             "set -e && cargo test",
@@ -1392,7 +1530,7 @@ error: test failed, to rerun pass `--bin demo`"##;
         assert_eq!(
             out,
             json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": {
-                "command": "cargo check --message-format=json --all-targets 2>&1 | /opt/agy/agyfast-rs cli filter 'cargo check --all-targets'",
+                "command": "{ if cargo check --message-format=json --all-targets; then printf '\\0%s' 0; else printf '\\0%s' \"$?\"; fi; } 2>&1 | /opt/agy/agyfast-rs cli filter --framed 'cargo check --all-targets'",
                 "description": "check", "timeout": 120000, "run_in_background": false, "future_field": {"x": [1]}}}})
         );
         assert!(out["hookSpecificOutput"].get("permissionDecision").is_none());
@@ -1405,20 +1543,20 @@ error: test failed, to rerun pass `--bin demo`"##;
     fn hook_rewrites_each_check_step_of_a_chain() {
         assert_eq!(
             rewritten("cd crates/x && cargo check && cargo test foo").as_deref(),
-            Some("cd crates/x && cargo check --message-format=json 2>&1 | /opt/agy/agyfast-rs cli filter 'cargo check' && cargo test foo 2>&1 | /opt/agy/agyfast-rs cli filter 'cargo test foo'")
+            Some("cd crates/x && { if cargo check --message-format=json; then printf '\\0%s' 0; else printf '\\0%s' \"$?\"; fi; } 2>&1 | /opt/agy/agyfast-rs cli filter --framed 'cargo check' && { if cargo test foo; then printf '\\0%s' 0; else printf '\\0%s' \"$?\"; fi; } 2>&1 | /opt/agy/agyfast-rs cli filter --framed 'cargo test foo'")
         );
         // A trailing 2>&1 is the model's habit, not a wish for raw output; other steps stay as written.
         assert_eq!(
             rewritten("cargo test 2>&1").as_deref(),
-            Some("cargo test 2>&1 | /opt/agy/agyfast-rs cli filter 'cargo test'")
+            Some("{ if cargo test; then printf '\\0%s' 0; else printf '\\0%s' \"$?\"; fi; } 2>&1 | /opt/agy/agyfast-rs cli filter --framed 'cargo test'")
         );
         assert_eq!(
             rewritten("cargo check --all-targets 2>&1 && echo done 2>&1").as_deref(),
-            Some("cargo check --message-format=json --all-targets 2>&1 | /opt/agy/agyfast-rs cli filter 'cargo check --all-targets' && echo done 2>&1")
+            Some("{ if cargo check --message-format=json --all-targets; then printf '\\0%s' 0; else printf '\\0%s' \"$?\"; fi; } 2>&1 | /opt/agy/agyfast-rs cli filter --framed 'cargo check --all-targets' && echo done 2>&1")
         );
         assert_eq!(
             rewritten("cargo run && cargo clippy").as_deref(),
-            Some("cargo run && cargo clippy --message-format=json 2>&1 | /opt/agy/agyfast-rs cli filter 'cargo clippy'")
+            Some("cargo run && { if cargo clippy --message-format=json; then printf '\\0%s' 0; else printf '\\0%s' \"$?\"; fi; } 2>&1 | /opt/agy/agyfast-rs cli filter --framed 'cargo clippy'")
         );
     }
 
@@ -1426,7 +1564,7 @@ error: test failed, to rerun pass `--bin demo`"##;
     #[test]
     fn hook_quotes_the_original_command_for_the_shell() {
         let out = rewritten(r#"cargo test "it's" -- --exact"#).unwrap();
-        assert_eq!(out, r#"cargo test "it's" -- --exact 2>&1 | /opt/agy/agyfast-rs cli filter 'cargo test "it'\''s" -- --exact'"#);
+        assert_eq!(out, r#"{ if cargo test "it's" -- --exact; then printf '\0%s' 0; else printf '\0%s' "$?"; fi; } 2>&1 | /opt/agy/agyfast-rs cli filter --framed 'cargo test "it'\''s" -- --exact'"#);
         // The shell hands the filter the original command back byte for byte.
         let echoed = Command::new("sh").arg("-c").arg(format!("printf %s {}", sh_quote(r#"cargo test "it's" $HOME `x`"#))).output().unwrap();
         assert_eq!(String::from_utf8(echoed.stdout).unwrap(), r#"cargo test "it's" $HOME `x`"#);
@@ -1476,23 +1614,23 @@ error: test failed, to rerun pass `--bin demo`"##;
 
     #[test]
     fn filter_reads_failure_from_the_content() {
-        let (out, failed) = filter("cargo check", CARGO_CHECK);
+        let (out, failed) = filter("cargo check", CARGO_CHECK, None);
         assert!(failed && out.starts_with("[agyfast-rs FAIL] cargo check\nsrc/main.rs:6:18 [E0308]") && out.ends_with("1 error, 1 warning"), "{out}");
-        let (out, failed) = filter("cargo clippy", CARGO_CLIPPY);
+        let (out, failed) = filter("cargo clippy", CARGO_CLIPPY, None);
         assert!(!failed && out == "[agyfast-rs PASS] cargo clippy: 0 errors, 2 warnings", "{out}");
-        let (out, failed) = filter("cargo test", CARGO_TEST);
+        let (out, failed) = filter("cargo test", CARGO_TEST, None);
         assert!(failed && out.contains("test result: FAILED. 1 passed; 1 failed") && !out.contains("ok_one"), "{out}");
-        assert!(filter("go test ./...", GO_TEST).1);
-        assert!(filter("npx tsc --noEmit", "src/a.ts(12,5): error TS2322: Type 'string' is not assignable.").1);
-        assert!(!filter("npx eslint src", "/r/a.ts\n  9:1  warning  x  no-console\n\n✖ 1 problem (0 errors, 1 warning)").1);
-        assert!(!filter("pytest", "===== 3 passed in 0.10s =====").1);
-        assert!(filter("pytest", "FAILED t.py::bad - assert 1\n===== 1 failed, 2 passed in 0.10s =====").1);
+        assert!(filter("go test ./...", GO_TEST, None).1);
+        assert!(filter("npx tsc --noEmit", "src/a.ts(12,5): error TS2322: Type 'string' is not assignable.", None).1);
+        assert!(!filter("npx eslint src", "/r/a.ts\n  9:1  warning  x  no-console\n\n✖ 1 problem (0 errors, 1 warning)", None).1);
+        assert!(!filter("pytest", "===== 3 passed in 0.10s =====", None).1);
+        assert!(filter("pytest", "FAILED t.py::bad - assert 1\n===== 1 failed, 2 passed in 0.10s =====", None).1);
         // Without cargo's JSON (a manifest error), cargo's own error line decides.
-        assert!(filter("cargo check", "error: failed to parse manifest at `/w/Cargo.toml`").1);
+        assert!(filter("cargo check", "error: failed to parse manifest at `/w/Cargo.toml`", None).1);
         let lines: Vec<String> = (1..=500).map(|i| format!("line {i}")).collect();
-        let (out, failed) = filter("make all", &lines.join("\n"));
+        let (out, failed) = filter("make all", &lines.join("\n"), None);
         assert!(!failed && out.starts_with("[agyfast-rs] make all (status not judged)\nline 1\n") && out.ends_with("line 500"), "{out}");
-        assert!(filter("cargo test", &"x".repeat(50_000)).0.len() <= budget::CAP);
+        assert!(filter("cargo test", &"x".repeat(50_000), None).0.len() <= budget::CAP);
     }
 
     #[cfg(unix)] // rustc prints `src\lib.rs` on Windows
@@ -1505,15 +1643,15 @@ error: test failed, to rerun pass `--bin demo`"##;
         let sh = |c: &str| String::from_utf8_lossy(&Command::new("sh").arg("-c").arg(c).current_dir(p).output().unwrap().stdout).into_owned();
         let lib = "pub fn add(a: i32, b: i32) -> i32 { a + b }\n#[test]\nfn good() { assert_eq!(add(1, 2), 3); }\n";
         std::fs::write(p.join("src/lib.rs"), lib).unwrap();
-        let (out, failed) = filter("cargo check", &sh("cargo check --message-format=json 2>&1"));
+        let (out, failed) = filter("cargo check", &sh("cargo check --message-format=json 2>&1"), None);
         assert_eq!((out.as_str(), failed), ("[agyfast-rs PASS] cargo check: 0 errors, 0 warnings", false));
 
         std::fs::write(p.join("src/lib.rs"), format!("{lib}#[test]\nfn bad() {{ assert_eq!(add(2, 2), 5, \"math is broken\"); }}\n")).unwrap();
-        let (out, failed) = filter("cargo test", &sh("cargo test 2>&1"));
+        let (out, failed) = filter("cargo test", &sh("cargo test 2>&1"), None);
         assert!(failed && out.starts_with("[agyfast-rs FAIL] cargo test\n") && out.contains("math is broken") && out.contains("test result: FAILED. 1 passed; 1 failed"), "{out}");
 
         std::fs::write(p.join("src/lib.rs"), "pub fn add(a: i32) -> i32 { let x: i32 = \"five\"; a + x }\n").unwrap();
-        let (out, failed) = filter("cargo check", &sh("cargo check --message-format=json 2>&1"));
+        let (out, failed) = filter("cargo check", &sh("cargo check --message-format=json 2>&1"), None);
         assert!(failed && out.contains("src/lib.rs:1:42 [E0308] mismatched types") && out.ends_with("1 error, 0 warnings"), "{out}");
     }
 
@@ -1549,7 +1687,7 @@ error: test failed, to rerun pass `--bin demo`"##;
 
     #[test]
     fn backslash_is_a_path_separator_only_on_windows() {
-        for s in [r"cd crates\foo", r"cargo check --manifest-path sub\Cargo.toml", r".\x", r"a\_b\-c\*.rs"] {
+        for s in [r"cd crates\foo", r"cargo check --manifest-path sub\Cargo.toml", r".\x", r"a\_b\-c\*.rs", r"cargo check --manifest-path .\папка\Cargo.toml", r"cd .\日本語\proj"] {
             assert!(escapes(s, false) && !escapes(s, true), "{s}");
         }
         for s in [r#"echo \"x\""#, r"a \&& b", r"trailing\", "a\\\nb", r"a\ b", r"a\$b"] {
@@ -1576,6 +1714,41 @@ error: test failed, to rerun pass `--bin demo`"##;
         }
     }
 
+    #[test]
+    fn needs_sh_routes_only_posix_commands() {
+        for c in [
+            "cargo check --all-targets",
+            r"cargo check --manifest-path .\Cargo.toml",
+            r"cargo check --manifest-path .\папка\Cargo.toml",
+            r"cd .\日本語\proj",
+            "cargo check --manifest-path ./Cargo.toml",
+            r#"powershell -NoProfile -Command "exit -1073741819""#,
+            r#"python -c "import sys; sys.exit(1)""#,
+            "exit -1073741502",
+            r#""C:\Program Files\Git\cmd\git.exe" --version"#,
+            "ping -n 30 127.0.0.1",
+            "set FOO=1 && echo %FOO%",
+            "cargo test | findstr FAIL",
+        ] {
+            assert!(!needs_sh(c), "unexpected sh route: {c}");
+        }
+        for c in [
+            "echo 'hello'",
+            r"cargo check --manifest-path '.\Cargo.toml'",
+            "RUST_BACKTRACE=1 cargo test",
+            "sleep 1",
+            "seq 1 5; exit 2",
+            "cargo test | head -n 5",
+            "./scripts/test.sh",
+            "echo $HOME",
+            "echo ok >/dev/null",
+            "export FOO=1 && echo $FOO",
+        ] {
+            assert!(needs_sh(c), "expected sh route: {c}");
+        }
+        assert!(pre_bash("\u{feff}\u{feff}{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"cargo check\"}}", "agyfast-rs").is_some());
+    }
+
     // Works whether the shell found is Git's sh.exe or cmd.exe.
     #[cfg(windows)]
     #[test]
@@ -1585,9 +1758,187 @@ error: test failed, to rerun pass `--bin demo`"##;
         assert_eq!(r.status, Status::Pass);
         assert!(r.out.contains("hello"), "{}", r.out);
         assert_eq!(execute("exit 3", dir.path(), 10).status, Status::Fail("exit 3".into()));
+        assert_eq!(execute("exit -1073741819", dir.path(), 10).status, Status::Fail("exit 0xC0000005 - access violation".into()));
+        assert_eq!(execute("exit -1073741502", dir.path(), 10).status, Status::Fail("exit 0xC0000142 - DLL init failed".into()));
+        assert!(execute(r"echo .\Cargo.toml", dir.path(), 10).out.contains(r".\Cargo.toml"));
+        if find_sh().is_some() {
+            assert_eq!(execute("sleep 0", dir.path(), 10).status, Status::Pass);
+            assert_eq!(execute("echo 'a b'", dir.path(), 10).out.trim(), "a b");
+        }
         let r = execute("ping -n 30 127.0.0.1", dir.path(), 1);
         assert_eq!(r.status, Status::Timeout);
         assert!(r.ms < 10_000, "took {}ms", r.ms);
         assert!(body(&r, false, budget::CAP).contains("TIMED OUT after 1s, process tree killed"));
+    }
+
+    #[test]
+    fn kind_and_hook_respect_quotes_around_and_and_pipe() {
+        for c in [
+            r#"git commit -m "fix && pytest""#,
+            r#"git commit -m "fix \" && pytest""#,
+            "git commit -m 'fix && pytest'",
+            r#"echo "a && b" | cargo test"#,
+        ] {
+            assert_eq!(kind(c), Kind::Generic, "{c}");
+            assert_eq!(rewritten(c), None, "{c}");
+        }
+        assert_eq!(kind(r#"cargo test -- "a && b""#), Kind::Tests);
+        assert!(rewritten(r#"cargo test -- "a && b""#).is_some());
+        assert_eq!(kind(r#"cargo test -- "a | b""#), Kind::Tests);
+        assert!(rewritten(r#"cargo test -- "a | b""#).is_some());
+        assert_eq!(kind(r#"echo "a | b" && cargo check | head"#), Kind::Cargo);
+        assert_eq!(kind("cargo check 2>&1 | tail && cargo test"), Kind::Tests);
+    }
+
+    #[test]
+    fn filter_catches_startup_errors_and_avoids_false_fails_and_overflow() {
+        for (cmd, raw) in [
+            ("cargo check", "bash: cargo: command not found"),
+            ("cargo check", "sh: 1: cargo: not found"),
+            ("cargo check", "'cargo' is not recognized as an internal or external command,\r\noperable program or batch file."),
+            ("pytest", "bash: pytest: command not found"),
+            ("pytest", "ERROR: file or directory not found: tests/missing.py"),
+            ("go test ./...", "go: go.mod file not found in current directory"),
+            ("go test ./...", "go: cannot find main module, but found .git"),
+            ("vitest", "  ✓ handles 1 error 2ms\nTests  1 failed | 1 passed (2)"),
+        ] {
+            assert!(filter(cmd, raw, None).1, "expected fail for `{cmd}` on `{raw}`");
+        }
+        for (cmd, raw) in [
+            ("cargo test", "test tests::test_handles_1_error ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"),
+            ("cargo test", "test_handles_1_error"),
+            ("vitest", "  ✓ handles 1 error 2ms\n  ✔ handles 2 failures 1ms\n  √ handles 3 errors 1ms\nTests  3 passed (3)"),
+            ("go test ./...", "=== RUN   Test_1_error\n--- PASS: Test_1_error (0.00s)\nPASS\nok  \texample.com/x\t0.01s"),
+            ("cargo clippy", CARGO_CLIPPY),
+        ] {
+            assert!(!filter(cmd, raw, None).1, "expected pass for `{cmd}` on `{raw}`");
+        }
+        let long_cmd = format!("cargo check {}", "a".repeat(9000));
+        let (out, failed) = filter(&long_cmd, CARGO_CHECK, None);
+        assert!(failed && out.len() <= budget::CAP, "len={}", out.len());
+    }
+
+    #[test]
+    fn cargo_global_value_flags_and_case_insensitive_basenames() {
+        assert_eq!(kind("cargo -C build test"), Kind::Tests);
+        assert_eq!(inject_json("cargo -C build test"), None);
+        assert_eq!(kind("cargo -C crates/foo check"), Kind::Cargo);
+        assert_eq!(
+            inject_json("cargo -C crates/foo check").as_deref(),
+            Some("cargo -C crates/foo check --message-format=json")
+        );
+        assert_eq!(kind("cargo --color always check"), Kind::Cargo);
+        assert_eq!(
+            inject_json("cargo --color always clippy --all-targets").as_deref(),
+            Some("cargo --color always clippy --message-format=json --all-targets")
+        );
+        assert_eq!(kind("cargo --config net.offline=true -Z unstable-options build"), Kind::Cargo);
+        assert_eq!(kind("cargo --explain E0308"), Kind::Generic);
+        assert_eq!(kind("cargo -C"), Kind::Generic);
+        assert_eq!(basename(r"C:\x\CARGO.EXE"), "CARGO");
+        assert_eq!(kind(r"C:\x\CARGO.EXE check"), Kind::Cargo);
+        assert_eq!(kind(r"C:\x\CARGO.EXE test"), Kind::Tests);
+        assert_eq!(kind(r"C:\x\PYTEST.EXE tests"), Kind::Tests);
+        assert_eq!(kind(r".\bin\ESLINT.CMD src"), Kind::Lint);
+        assert_eq!(inject_json("CARGO.EXE check").as_deref(), Some("CARGO.EXE check --message-format=json"));
+        if cfg!(windows) {
+            assert_eq!(inject_json(r"C:\x\CARGO.EXE check").as_deref(), Some(r"C:\x\CARGO.EXE check --message-format=json"));
+        }
+    }
+
+    #[test]
+    fn windows_chain_steps_handles_case_env_and_globs() {
+        use Step::{Cd, Run};
+        assert_eq!(chain_steps(vec!["CD sub", "cargo test"], true), Some(vec![Cd("sub"), Run("cargo test")]));
+        for parts in [
+            ["SET FOO=1", "echo %FOO%"],
+            ["PUSHD sub", "cargo test"],
+            ["cd %TEMP%", "dir"],
+            [r#"CD "%TEMP%""#, "dir"],
+            ["cd sub*", "cargo test"],
+            ["cd sub?", "cargo test"],
+        ] {
+            assert_eq!(chain_steps(parts.to_vec(), true), None, "{parts:?}");
+        }
+        assert_eq!(chain_steps(vec!["cd sub*", "cargo test"], false), None);
+        if cfg!(windows) {
+            assert_eq!(split_chain("CD sub && cargo test"), Some(vec![Cd("sub"), Run("cargo test")]));
+            assert_eq!(split_chain("SET FOO=1 && echo %FOO%"), None);
+            assert_eq!(split_chain("cd %TEMP% && dir"), None);
+        }
+    }
+
+    #[test]
+    fn windows_compress_lint_keeps_backslash_paths_and_drive_letters() {
+        let eslint = "\nD:\\repo\\src\\a.ts\n  3:7   error    'x' is assigned a value but never used  no-unused-vars\n  9:1   warning  Unexpected console statement            no-console\n\n✖ 2 problems (1 error, 1 warning)\n";
+        assert_eq!(
+            compress_lint(eslint),
+            "D:\\repo\\src\\a.ts\n  3:7   error    'x' is assigned a value but never used  no-unused-vars\n  9:1   warning  Unexpected console statement            no-console\n✖ 2 problems (1 error, 1 warning)"
+        );
+        let biome = "C:\\repo\\src\\a.ts:1:1 lint/style/useConst  FIXABLE  ━━━━━━━━━━\n\n  × This let declares a variable that is only assigned once.\n\n  > 1 │ let a = 1;\n      │ ^^^\n\n  i Safe fix: Use const instead.\n\nChecked 4 files in 3ms. No fixes applied.\nFound 1 error.";
+        let out = compress_lint(biome);
+        assert!(out.starts_with("C:\\repo\\src\\a.ts:1:1 lint/style/useConst") && out.contains("× This let") && out.ends_with("Found 1 error."), "{out}");
+        assert!(!out.contains('│') && !out.contains("Safe fix"), "{out}");
+        let tsc = "D:\\repo\\src\\a.ts(12,5): error TS2322: Type 'string' is not assignable to type 'number'.\n\n12 const n: number = 'x';\nFound 1 error.";
+        assert_eq!(
+            compress_lint(tsc),
+            "D:\\repo\\src\\a.ts(12,5): error TS2322: Type 'string' is not assignable to type 'number'.\nFound 1 error."
+        );
+    }
+
+    #[test]
+    fn execute_chain_and_run_work_cross_platform_including_expired_deadline() {
+        let dir = tmp();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let pass = execute_chain(&[Step::Cd("sub"), Step::Run("echo chain_ok")], dir.path(), 10);
+        assert_eq!(pass.status, Status::Pass);
+        assert_eq!(pass.steps.len(), 1);
+        assert!(pass.steps[0].1.as_ref().unwrap().out.contains("chain_ok"));
+
+        let missing = execute_chain(&[Step::Cd("missing"), Step::Run("echo never")], dir.path(), 10);
+        assert_eq!(missing.status, Status::Fail("cd: no such directory: missing".into()));
+        assert!(body(&missing, false, budget::CAP).ends_with("Not run: `echo never`"));
+
+        let fail = execute_chain(&[Step::Run("echo one"), Step::Run("exit 4"), Step::Run("echo never")], dir.path(), 10);
+        assert_eq!(fail.status, Status::Fail("exit 4".into()));
+        assert!(body(&fail, false, budget::CAP).ends_with("Not run: `echo never`"));
+
+        // An already-expired deadline records Timeout without spawning the step.
+        let marker = dir.path().join("should_not_exist");
+        let cmd = if cfg!(windows) { "echo x > should_not_exist" } else { "touch should_not_exist" };
+        let expired = execute_chain(&[Step::Run(cmd), Step::Run("echo skipped")], dir.path(), 0);
+        assert_eq!(expired.status, Status::Timeout);
+        assert_eq!(expired.steps.len(), 2);
+        let first = expired.steps[0].1.as_ref().unwrap();
+        assert_eq!(first.status, Status::Timeout);
+        assert_eq!(first.ms, 0);
+        assert!(expired.steps[1].1.is_none());
+        assert!(!marker.exists(), "step should not have spawned after expired deadline");
+
+        let cwd = dir.path().to_str().unwrap();
+        let one = run(json!({"cwd": cwd, "commands": [{"command": "echo single_ok"}]})).unwrap();
+        assert!(one.starts_with("Checks: 1/1 passed") && one.contains("single_ok"), "{one}");
+        let two = run(json!({"cwd": cwd, "commands": [{"command": "echo a"}, {"command": "exit 2"}]})).unwrap();
+        assert!(two.starts_with("Checks: 1/2 passed, 1 failed") && two.contains("FAIL (exit 2)"), "{two}");
+    }
+
+    #[test]
+    fn read_capped_omits_middle_past_cap() {
+        use std::io::Write;
+        let mut small = tempfile::tempfile().unwrap();
+        small.write_all(b"small output").unwrap();
+        assert_eq!(read_capped(&mut small).unwrap(), "small output");
+
+        let mut big = tempfile::tempfile().unwrap();
+        let total = READ_CAP + 1234;
+        big.set_len(total).unwrap();
+        big.seek(SeekFrom::Start(0)).unwrap();
+        big.write_all(b"HEAD").unwrap();
+        big.seek(SeekFrom::Start(total - 4)).unwrap();
+        big.write_all(b"TAIL").unwrap();
+        let out = read_capped(&mut big).unwrap();
+        let marker = "\n... [1234 bytes of output omitted] ...\n";
+        assert!(out.starts_with("HEAD") && out.ends_with("TAIL") && out.contains(marker));
+        assert_eq!(out.len(), READ_CAP as usize + marker.len());
     }
 }

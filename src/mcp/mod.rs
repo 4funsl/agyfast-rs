@@ -8,7 +8,14 @@ use serde_json::{Value, json};
 use std::io::{BufRead, Write};
 
 fn handle(msg: &Value) -> Option<Value> {
-    let method = msg.get("method")?.as_str()?;
+    if !msg.is_object() {
+        return Some(json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": "invalid request"}}));
+    }
+    let Some(method) = msg.get("method").and_then(Value::as_str) else {
+        return msg.get("id").map(|id| {
+            json!({"jsonrpc": "2.0", "id": id.clone(), "error": {"code": -32600, "message": "invalid request"}})
+        });
+    };
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
     let result = match method {
         "initialize" => Ok(json!({
@@ -79,5 +86,9 @@ mod tests {
         let unknown = handle(&json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "nope", "arguments": {"toolSummary": "x"}}})).unwrap();
         assert_eq!(unknown["result"]["isError"], true);
         assert_eq!(handle(&json!({"jsonrpc": "2.0", "id": 4, "method": "bogus"})).unwrap()["error"]["code"], -32601);
+        assert_eq!(handle(&json!([1])).unwrap()["error"]["code"], -32600);
+        assert_eq!(handle(&json!({"jsonrpc": "2.0", "id": 1})).unwrap()["error"]["code"], -32600);
+        assert_eq!(handle(&json!({"jsonrpc": "2.0", "id": 1, "method": 123})).unwrap()["error"]["code"], -32600);
+        assert!(handle(&json!({"jsonrpc": "2.0"})).is_none());
     }
 }
