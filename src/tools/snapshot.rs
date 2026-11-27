@@ -359,7 +359,8 @@ mod tests {
         git(&["status"]); // the setup does run the filter without the overrides
         assert!(std::fs::remove_file(p.join("marker")).is_ok());
         bump(2000);
-        assert_eq!(git_filters(p, Instant::now() + Duration::from_secs(10)), Some(vec!["evil".to_string()]));
+        // The machine's own git config may add drivers (git-lfs on CI runners).
+        assert!(git_filters(p, Instant::now() + Duration::from_secs(10)).unwrap().contains(&"evil".to_string()));
         assert!(snapshot(p).contains("0 dirty"));
         let out = crate::tools::search::run(json!({"cwd": p, "queries": [{"type": "git", "pattern": "diff --stat"}]})).unwrap();
         assert!(out.contains("(empty output)"), "{out}");
