@@ -129,6 +129,8 @@ are compared only between runs that reached the same score. "Cost" is weighted t
 | vs no plugin | — | −13% | **−24%** |
 
 On Gemini 4 Hydrogen Medium the same task gave −15% cost and 5 fewer turns against no plugin.
+Repeated on 0.1.4 with two runs: 19 turns against 26 and 141 s against 179 s both times, and −9%
+and −17% cost against a fresh no-plugin run ([details](docs/BENCHMARKS.md#repeat-of-the-hard-task-on-agyfast-rs-014)).
 
 ### agyfast-rs vs agy-fast
 

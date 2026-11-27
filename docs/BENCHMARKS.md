@@ -32,9 +32,10 @@ In every table below all columns have the same score.
 **Cost-weighted tokens** = `output × 5 + input + cache_read × 0.1`. This is the same 1 : 0.1 : 5
 weighting other Antigravity tooling uses to approximate quota.
 
-**Noise.** Repeating one identical configuration changed cost by 11% and the turn count by 3. Each
+**Noise.** Repeating one identical configuration changed cost by 11% and the turn count by 3; a
+second repeat (0.1.4, below) changed cost by 9% and tool calls by 14 at the same turn count. Each
 cell below is a single run, so treat differences under roughly 15% as "not shown". Differences in
-turns and tool calls have been more stable than differences in cost.
+turns and wall time have been more stable than differences in cost and tool calls.
 
 ## Tasks
 
@@ -67,6 +68,33 @@ effective maximum is 14.
 
 The saving is in input: fewer turns re-reading the conversation. Output is the same in all three,
 which is what you would expect when the same code gets written.
+
+### Repeat of the hard task on agyfast-rs 0.1.4
+
+Same task, model and settings one day later, after the 0.1.4 fixes: one more run without a plugin
+and two identical runs with the 0.1.4 build.
+
+| | No plugin (repeat) | agyfast-rs 0.1.4, run 1 | agyfast-rs 0.1.4, run 2 |
+| :--- | ---: | ---: | ---: |
+| Score | 14/15 | 14/15 | 14/15 |
+| Wall time | 179 s | 141 s | 141 s |
+| LLM turns | 26 | 19 | 19 |
+| Tool calls | 51 | 38 | 24 |
+| `read_file` calls | 16 | 11 | 12 |
+| Uncached input tokens | 88,633 | 76,669 | 71,853 |
+| Cached input tokens | 874,912 | 694,859 | 627,924 |
+| Output tokens | 17,681 | 18,719 | 16,941 |
+| First-turn input (fixed prefix) | 12,216 | 14,938 | 14,945 |
+| **Cost-weighted** | **264,529** | **239,750** | **219,350** |
+| vs this no-plugin run | — | −9% | −17% |
+
+- **The plain host did not change:** the two no-plugin runs differ by 3% in cost and one turn.
+- **The two 0.1.4 runs differ by 9% in cost and 14 tool calls** with the same turn count, score and
+  wall time. Run 1 made all 21 edits with the built-in `edit_file`; run 2 used the batched
+  `apply_edits` five times and `edit_file` twice. Nothing in the plugin differed between them.
+- **Across all five Low runs:** without a plugin 25–26 turns, 179–184 s and 265–273k; with
+  `agyfast-rs` 16–19 turns, 141–146 s and 207–240k. The cost saving ranges from 9% to 24% depending
+  on which pair of runs is compared; the turn and time savings were the same in every pair.
 
 ### Solo agent, hard task, Gemini 4 Hydrogen Medium
 
@@ -109,8 +137,8 @@ run; the rest was the coordinator reading before the split and integrating after
 
 ## What the results say
 
-1. **Solo:** `agyfast-rs` reduced turns by 5–9 and cost by 15–24% against the plain host at equal
-   score, on two effort levels.
+1. **Solo:** `agyfast-rs` reduced turns by 5–9 and cost by 9–24% against the plain host at equal
+   score, on two effort levels and two builds.
 2. **Against agy-fast:** 4 fewer turns and 13% less cost in the one head-to-head run; that gap is
    about the size of the noise. The clearer differences are structural: less fixed context and
    build output that always goes through the compressor.
@@ -133,7 +161,8 @@ Published because it is part of the measurement:
 
 ## Limits
 
-- One run per configuration.
+- One run per configuration, except the hard task on Low: two runs without a plugin and three
+  with `agyfast-rs` (one on an earlier build, two on 0.1.4).
 - Two tasks, both on this repository's own Rust code, both under five minutes.
 - One model family (Gemini 4 Hydrogen); Antigravity CLI 1.5.17–1.5.18.
 - Quality is whatever the scorers check; diffs were not otherwise reviewed.
