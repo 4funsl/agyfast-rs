@@ -26,7 +26,8 @@ fn lock_dir() -> io::Result<std::path::PathBuf> {
 
 #[cfg(not(unix))]
 fn lock_dir() -> io::Result<std::path::PathBuf> {
-    let dir = std::env::temp_dir().join("agyfast-rs-locks");
+    // Per-user and independent of TEMP/TMP: processes with different temp dirs must lock the same file.
+    let dir = std::env::var_os("LOCALAPPDATA").map_or_else(std::env::temp_dir, std::path::PathBuf::from).join("agyfast-rs-locks");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
