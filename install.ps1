@@ -45,7 +45,7 @@ Write-Json (Join-Path $pluginDir "hooks.json") $hooks
 $rules = [IO.File]::ReadAllText((Join-Path $root "plugin\rules\AGENTS.md"))
 $posixCmd = '"$HOME/.gemini/config/plugins/agyfast-rs/bin/agyfast-rs" cli worker-brief'
 if (-not $rules.Contains($posixCmd)) { throw "plugin\rules\AGENTS.md no longer contains the worker-brief command; update install.ps1" }
-[IO.File]::WriteAllText((Join-Path $pluginDir "rules\AGENTS.md"), $rules.Replace($posixCmd, "& `"$pluginExe`" cli worker-brief"), (New-Object Text.UTF8Encoding $false))
+[IO.File]::WriteAllText((Join-Path $pluginDir "rules\AGENTS.md"), $rules.Replace($posixCmd, "& '$($pluginExe.Replace("'", "''"))' cli worker-brief"), (New-Object Text.UTF8Encoding $false))
 
 Write-Host "Installed plugin: $pluginDir"
 Write-Host "Installed CLI:    $cliDir\agyfast-rs.exe"

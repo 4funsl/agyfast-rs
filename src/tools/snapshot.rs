@@ -4,20 +4,22 @@ use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wait_timeout::ChildExt;
 
 const MAX_BYTES: usize = 1500;
 const MAX_STDIN: usize = 256 * 1024;
 const GIT_TIMEOUT: Duration = Duration::from_millis(800);
+const GIT_CAP: usize = 64 * 1024;
 const SKIP_DIRS: &[&str] = &["node_modules", "target", "dist", "build", "out", "venv", "__pycache__", "vendor"];
 
 fn git_child(cwd: &Path, args: &[&str]) -> Option<std::process::Child> {
     Command::new("git")
-        .args(["--no-optional-locks", "-c", "core.quotePath=false", "--no-pager"])
+        .args(["--no-optional-locks", "-c", "core.quotePath=false", "-c", "core.fsmonitor=false", "--no-pager"])
         .args(args)
         .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -25,16 +27,34 @@ fn git_child(cwd: &Path, args: &[&str]) -> Option<std::process::Child> {
         .ok()
 }
 
-fn git_finish(child: Option<std::process::Child>) -> Option<String> {
+struct RunningGit {
+    child: std::process::Child,
+    reader: std::thread::JoinHandle<Vec<u8>>,
+}
+
+fn git_start(child: Option<std::process::Child>) -> Option<RunningGit> {
     let mut child = child?;
     let mut out = child.stdout.take()?;
     let reader = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = out.by_ref().take(64 * 1024).read_to_string(&mut s);
-        s
+        let mut buf = Vec::new();
+        let _ = out.by_ref().take(GIT_CAP as u64).read_to_end(&mut buf);
+        buf
     });
-    match child.wait_timeout(GIT_TIMEOUT) {
-        Ok(Some(st)) if st.success() => reader.join().ok(),
+    Some(RunningGit { child, reader })
+}
+
+fn git_finish(running: Option<RunningGit>, deadline: Instant) -> Option<String> {
+    let RunningGit { mut child, reader } = running?;
+    let rem = deadline.saturating_duration_since(Instant::now());
+    match child.wait_timeout(rem) {
+        Ok(Some(st)) => {
+            let buf = reader.join().ok()?;
+            if st.success() || buf.len() == GIT_CAP {
+                Some(String::from_utf8_lossy(&buf).into_owned())
+            } else {
+                None
+            }
+        }
         _ => {
             let _ = child.kill();
             let _ = child.wait();
@@ -46,11 +66,12 @@ fn git_finish(child: Option<std::process::Child>) -> Option<String> {
 /// Branch, dirty/untracked counts and the last commit subjects; `None` outside a repo.
 fn git_section(cwd: &Path) -> Option<String> {
     cwd.ancestors().find(|d| d.join(".git").exists())?;
-    // Both git processes run concurrently.
-    let status = git_child(cwd, &["status", "--porcelain=v1", "--branch"]);
-    let log = git_child(cwd, &["log", "-n", "3", "--format=%h %s"]);
-    let status = git_finish(status);
-    let log = git_finish(log);
+    // Both git processes and their stdout readers run concurrently under one deadline.
+    let status = git_start(git_child(cwd, &["status", "--porcelain=v1", "--branch"]));
+    let log = git_start(git_child(cwd, &["log", "-n", "3", "--format=%h %s"]));
+    let deadline = Instant::now() + GIT_TIMEOUT;
+    let status = git_finish(status, deadline);
+    let log = git_finish(log, deadline);
     let mut text = String::from("Git: ");
     match status {
         Some(s) => {
@@ -110,7 +131,7 @@ fn tree(cwd: &Path) -> String {
     let walk = ignore::WalkBuilder::new(cwd)
         .max_depth(Some(2))
         .require_git(false)
-        .filter_entry(|e| !(e.file_type().is_some_and(|t| t.is_dir()) && SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref())))
+        .filter_entry(|e| e.depth() == 0 || !(e.file_type().is_some_and(|t| t.is_dir()) && SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref())))
         .build();
     let mut top: BTreeMap<String, (bool, Vec<String>)> = BTreeMap::new();
     for e in walk.flatten().filter(|e| e.depth() > 0) {
@@ -210,7 +231,7 @@ fn response(payload: &Value, text: &str) -> Value {
 pub fn hook() {
     let out = read_payload()
         .and_then(|p| {
-            let text = snapshot(&workspace_dir(&p)?.canonicalize().ok()?);
+            let text = snapshot(&crate::core::cwd::simplify(workspace_dir(&p)?.canonicalize().ok()?));
             (!text.is_empty()).then(|| response(&p, &text))
         })
         .unwrap_or_else(|| json!({}));
@@ -293,5 +314,32 @@ mod tests {
         assert!(workspace_dir(&json!({"cwd": "/definitely/not/here"})).is_none());
         assert!(serde_json::from_slice::<Value>(strip_bom(b"\xef\xbb\xbf\xef\xbb\xbf{\"cwd\":\"/x\"}")).is_ok());
         assert_eq!(strip_bom(b"{\"a\":1}"), b"{\"a\":1}");
+    }
+
+    #[test]
+    fn tree_works_when_workspace_dir_is_named_build() {
+        let d = dir();
+        let root = d.path().join("build");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "").unwrap();
+        assert!(tree(&root).contains("src/ (1): a.rs"));
+    }
+
+    #[test]
+    fn git_finish_caps_at_64k_and_decodes_non_utf8() {
+        let d = dir();
+        let p = d.path();
+        assert!(Command::new("git").args(["init", "-q"]).current_dir(p).output().unwrap().status.success());
+        let mut raw = vec![b'a'; 70 * 1024];
+        raw[0] = 0xff;
+        raw[1] = 0xfe;
+        std::fs::write(p.join("blob.bin"), &raw).unwrap();
+        let hash = Command::new("git").args(["hash-object", "-w", "blob.bin"]).current_dir(p).output().unwrap();
+        assert!(hash.status.success());
+        let hash = String::from_utf8(hash.stdout).unwrap();
+        let running = git_start(git_child(p, &["cat-file", "blob", hash.trim()]));
+        let out = git_finish(running, Instant::now() + GIT_TIMEOUT).unwrap();
+        assert_eq!(out.len(), GIT_CAP + 4); // 2 invalid bytes -> 2x U+FFFD (6 bytes)
+        assert!(out.starts_with("\u{FFFD}\u{FFFD}aaa"));
     }
 }

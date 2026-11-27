@@ -1,21 +1,10 @@
 //! Cross-process advisory file locks for parallel `/swarm` edits.
 //! Lock files live in the system temp dir so `git status` stays clean.
 
-use crate::core::cwd::{key, simplify};
+use crate::core::cwd::{canonical, key};
 use std::fs::File;
 use std::io;
-use std::path::{Path, PathBuf};
-
-/// Canonical form of a path that may not exist yet (new files).
-fn canonical(path: &Path) -> PathBuf {
-    if let Ok(p) = path.canonicalize() {
-        return simplify(p);
-    }
-    match (path.parent().and_then(|p| p.canonicalize().ok()), path.file_name()) {
-        (Some(dir), Some(name)) => simplify(dir).join(name),
-        _ => std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()),
-    }
-}
+use std::path::Path;
 
 /// Take an exclusive lock for `path`, blocking until it is free.
 /// The lock is released when the returned handle is dropped (or the process dies).

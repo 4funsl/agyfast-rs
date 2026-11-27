@@ -2,7 +2,7 @@
 //! plugin directory; silently searching or editing there would be wrong.
 
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// `\\?\D:\x` -> `D:\x` when it is a plain drive path under MAX_PATH (not `\\?\UNC\`), else `None`.
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -19,6 +19,41 @@ pub fn simplify(p: PathBuf) -> PathBuf {
         return PathBuf::from(r);
     }
     p
+}
+
+/// Canonical path of a file that may not exist yet; resolves existing prefixes
+/// (following symlinks) and normalizes any remaining tail lexically.
+pub fn canonical(path: &Path) -> PathBuf {
+    if let Ok(p) = path.canonicalize() {
+        return simplify(p);
+    }
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map(|d| d.join(path)).unwrap_or_else(|_| path.to_path_buf())
+    };
+    let mut cur = PathBuf::new();
+    let mut resolving = true;
+    for c in abs.components() {
+        match c {
+            Component::Prefix(p) => cur.push(p.as_os_str()),
+            Component::RootDir => cur.push(c),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                cur.pop();
+            }
+            Component::Normal(s) => {
+                cur.push(s);
+                if resolving {
+                    match cur.canonicalize() {
+                        Ok(p) => cur = simplify(p),
+                        Err(_) => resolving = false,
+                    }
+                }
+            }
+        }
+    }
+    simplify(cur)
 }
 
 /// Identity key for dedup and lock names: NTFS is case-insensitive, so fold case on Windows (key only, never open it).
@@ -92,5 +127,26 @@ mod tests {
         assert_eq!(strip_verbatim(r"D:\work"), None);
         assert_eq!(strip_verbatim(&format!(r"\\?\D:\{}", "a".repeat(260))), None);
         assert_eq!(key(Path::new("/a/B")), OsString::from(if cfg!(windows) { "/a/b" } else { "/a/B" }));
+    }
+
+    #[test]
+    fn canonical_resolves_dotdot_and_deep_paths_consistently() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = simplify(dir.path().canonicalize().unwrap());
+        let target = dir.path().join("sub").join("nested").join("..").join("file.txt");
+        let before = canonical(&target);
+        assert_eq!(before, base.join("sub").join("file.txt"));
+        std::fs::create_dir_all(dir.path().join("sub").join("nested")).unwrap();
+        assert_eq!(canonical(&target), before);
+        #[cfg(unix)]
+        {
+            let real = dir.path().join("real");
+            std::fs::create_dir(&real).unwrap();
+            std::os::unix::fs::symlink(&real, dir.path().join("link")).unwrap();
+            assert_eq!(
+                canonical(&dir.path().join("link/a/b/c.txt")),
+                simplify(real.canonicalize().unwrap()).join("a/b/c.txt")
+            );
+        }
     }
 }

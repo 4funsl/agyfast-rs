@@ -58,16 +58,6 @@ struct Plan {
     summary: String,
 }
 
-/// Canonical path of a file that may not exist yet; symlinks resolve to their target.
-fn canonical(p: &Path) -> PathBuf {
-    p.canonicalize().map(cwd::simplify).unwrap_or_else(|_| {
-        match (p.parent().and_then(|d| d.canonicalize().ok()), p.file_name()) {
-            (Some(dir), Some(name)) => cwd::simplify(dir).join(name),
-            _ => std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()),
-        }
-    })
-}
-
 fn line_count(s: &str) -> i64 {
     (s.matches('\n').count() + usize::from(!s.is_empty() && !s.ends_with('\n'))) as i64
 }
@@ -97,14 +87,26 @@ fn snippet(lines: &[&str], from: usize, count: usize) -> String {
 fn closest(content: &str, target: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let tl: Vec<&str> = target.lines().collect();
-    let squash = |s: &str| s.split_whitespace().collect::<String>();
-    let want = squash(target);
+    let want: String = target.split_whitespace().collect();
     if !want.is_empty() {
-        for i in 0..lines.len() {
-            let window: String = lines[i..(i + tl.len()).min(lines.len())].iter().map(|l| squash(l)).collect();
-            if window.contains(&want) {
-                return format!(" Whitespace-insensitive match at line {} (fix indentation/spacing):{}", i + 1, snippet(&lines, i, tl.len()));
+        let mut squashed = String::with_capacity(content.len());
+        let mut sq_starts = Vec::with_capacity(lines.len());
+        for l in &lines {
+            sq_starts.push(squashed.len());
+            for w in l.split_whitespace() {
+                squashed.push_str(w);
             }
+        }
+        if let Some(pos) = squashed.find(&want) {
+            let i = sq_starts.partition_point(|&s| s <= pos).saturating_sub(1);
+            return format!(" Whitespace-insensitive match at line {} (fix indentation/spacing):{}", i + 1, snippet(&lines, i, tl.len()));
+        }
+    }
+    let mut index: std::collections::HashMap<&str, (usize, usize)> = std::collections::HashMap::with_capacity(lines.len());
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim();
+        if t.len() >= 3 {
+            index.entry(t).and_modify(|e| e.0 += 1).or_insert((1, i));
         }
     }
     let best = tl
@@ -112,10 +114,7 @@ fn closest(content: &str, target: &str) -> String {
         .enumerate()
         .map(|(idx, t)| (idx, t.trim()))
         .filter(|(_, t)| t.len() >= 3)
-        .filter_map(|(idx, t)| {
-            let hits: Vec<usize> = (0..lines.len()).filter(|&i| lines[i].trim() == t).collect();
-            (!hits.is_empty()).then(|| (hits.len(), usize::MAX - t.len(), hits[0].saturating_sub(idx)))
-        })
+        .filter_map(|(idx, t)| index.get(t).map(|&(count, first)| (count, usize::MAX - t.len(), first.saturating_sub(idx))))
         .min();
     match best {
         Some((_, _, at)) => format!(" Closest match near line {}:{}", at + 1, snippet(&lines, at, tl.len())),
@@ -149,7 +148,7 @@ fn plan_hunks(display: &str, content: &str, hunks: &[&Hunk]) -> Result<(String, 
     let mut spans = Vec::new();
     let mut errors = Vec::new();
     for (i, h) in hunks.iter().enumerate() {
-        let (t, r) = (fix(&h.target), fix(&h.replacement));
+        let (mut t, mut r) = (fix(&h.target), fix(&h.replacement));
         let err = |m: String| format!("{display} hunk #{}: {m}", i + 1);
         if t.is_empty() {
             errors.push(err("empty target".into()));
@@ -166,7 +165,12 @@ fn plan_hunks(display: &str, content: &str, hunks: &[&Hunk]) -> Result<(String, 
                 continue;
             }
         };
-        let found: Vec<usize> = content[ws..we].match_indices(&t).map(|(o, _)| o + ws).collect();
+        let mut found: Vec<usize> = content[ws..we].match_indices(&t).map(|(o, _)| o + ws).collect();
+        if found.is_empty() && crlf && h.target.contains('\n') && !h.target.contains("\r\n") && content[ws..we].contains(&h.target) {
+            t = h.target.clone();
+            r = h.replacement.replace("\r\n", "\n");
+            found = content[ws..we].match_indices(&t).map(|(o, _)| o + ws).collect();
+        }
         let ranged = h.start_line.is_some() || h.end_line.is_some();
         match found.len() {
             0 => {
@@ -338,6 +342,54 @@ fn bullets(header: &str, items: &[String], max: usize) -> String {
     format!("{header}\n{}", body.join("\n"))
 }
 
+fn rollback(w: &Plan) -> Result<(), String> {
+    let res = match &w.old {
+        Some((bytes, perms)) => write_atomic(&w.path, bytes, Some(perms), &mut false),
+        None => fs::remove_file(&w.path),
+    };
+    res.map_err(|e| format!("{}: {e}", w.display))
+}
+
+fn commit<'a>(plans: &'a [Plan], best_effort: bool, failed: &mut Vec<String>) -> Result<(Vec<&'a Plan>, Vec<String>), String> {
+    let mut written: Vec<&Plan> = Vec::new();
+    let mut rb_err: Vec<String> = Vec::new();
+    for p in plans {
+        let mut replaced = false;
+        match write_atomic(&p.path, &p.new, p.old.as_ref().map(|o| &o.1), &mut replaced) {
+            Ok(()) => written.push(p),
+            Err(e) if best_effort => {
+                let mut msg = format!("{}: write failed: {e}", p.display);
+                if replaced && let Err(re) = rollback(p) {
+                    msg.push_str(&format!("; rollback also failed: {re}"));
+                    rb_err.push(re);
+                }
+                failed.push(msg);
+            }
+            Err(e) => {
+                if replaced {
+                    written.push(p);
+                }
+                for w in &written {
+                    if let Err(re) = rollback(w) {
+                        rb_err.push(re);
+                    }
+                }
+                if rb_err.is_empty() {
+                    return Err(format!("Error: write failed for {}: {e}; rolled back {} file(s) (0 files modified)", p.path.display(), written.len()));
+                }
+                return Err(format!(
+                    "Error: write failed for {}: {e}; rollback failed for {} of {} file(s) (disk may be partially modified): {}",
+                    p.path.display(),
+                    rb_err.len(),
+                    written.len(),
+                    rb_err.join("; ")
+                ));
+            }
+        }
+    }
+    Ok((written, rb_err))
+}
+
 pub fn run(args: Value) -> Result<String, String> {
     let a: Args = serde_json::from_value(args).map_err(|e| format!("Error: invalid apply_edits arguments (0 files modified): {e}"))?;
     if !(1..=50).contains(&a.edits.len()) {
@@ -346,7 +398,7 @@ pub fn run(args: Value) -> Result<String, String> {
     let cwd = cwd::resolve(a.cwd.as_deref())?;
     let mut jobs: Vec<Job> = Vec::new();
     for e in a.edits {
-        let path = canonical(&cwd.join(&e.path));
+        let path = cwd::canonical(&cwd.join(&e.path));
         match jobs.iter_mut().find(|j| cwd::key(&j.path) == cwd::key(&path)) {
             Some(j) => j.entries.push(e),
             None => jobs.push(Job { display: e.path.clone(), path, entries: vec![e] }),
@@ -374,47 +426,36 @@ pub fn run(args: Value) -> Result<String, String> {
     if a.dry_run {
         return Ok(format!("Dry run: {} file(s) valid (0 files modified):\n{}", plans.len(), summaries.join("\n")));
     }
-    let rollback = |w: &Plan| {
-        let _ = match &w.old {
-            Some((bytes, perms)) => write_atomic(&w.path, bytes, Some(perms), &mut false),
-            None => fs::remove_file(&w.path),
-        };
-    };
-    let mut written: Vec<&Plan> = Vec::new();
-    for p in &plans {
-        let mut replaced = false;
-        match write_atomic(&p.path, &p.new, p.old.as_ref().map(|o| &o.1), &mut replaced) {
-            Ok(()) => written.push(p),
-            Err(e) if a.best_effort => {
-                if replaced {
-                    rollback(p);
-                }
-                failed.push(format!("{}: write failed: {e}", p.display));
-            }
-            Err(e) => {
-                if replaced {
-                    written.push(p);
-                }
-                for w in &written {
-                    rollback(w);
-                }
-                return Err(format!("Error: write failed for {}: {e}; rolled back {} file(s) (0 files modified)", p.path.display(), written.len()));
-            }
-        }
-    }
+    let (written, rb_err) = commit(&plans, a.best_effort, &mut failed)?;
     drop(locks);
     let lines: Vec<&str> = written.iter().map(|p| p.summary.as_str()).collect();
     if written.is_empty() {
-        return Err(bullets("Error: every write failed (0 files modified):", &failed, budget::CAP));
+        let hdr = if rb_err.is_empty() {
+            "Error: every write failed (0 files modified):"
+        } else {
+            "Error: every write failed (rollback also failed; disk may be partially modified):"
+        };
+        return Err(bullets(hdr, &failed, budget::CAP));
     }
     if !failed.is_empty() {
-        let head = format!(
-            "Partial edit applied ({}/{} file(s) written; {} not written, left unchanged).\nWritten:\n{}",
-            written.len(),
-            jobs.len(),
-            failed.len(),
-            lines.join("\n")
-        );
+        let head = if rb_err.is_empty() {
+            format!(
+                "Partial edit applied ({}/{} file(s) written; {} not written, left unchanged).\nWritten:\n{}",
+                written.len(),
+                jobs.len(),
+                failed.len(),
+                lines.join("\n")
+            )
+        } else {
+            format!(
+                "Partial edit applied ({}/{} file(s) written; {} failed, rollback failed for {} — disk may be partially modified).\nWritten:\n{}",
+                written.len(),
+                jobs.len(),
+                failed.len(),
+                rb_err.len(),
+                lines.join("\n")
+            )
+        };
         let tail = if a.verify.is_some() { "\nVerify skipped: not every file was applied." } else { "" };
         let rest = bullets("Not written:", &failed, budget::CAP.saturating_sub(head.len() + tail.len() + 1));
         return Ok(format!("{head}\n{rest}{tail}"));
@@ -576,5 +617,52 @@ mod tests {
             pms.set_readonly(false);
             fs::set_permissions(&p, pms).unwrap();
         }
+    }
+
+    #[test]
+    fn mixed_crlf_lf_hunk_edits_lf_block() {
+        let d = setup(&[("mix.txt", "head\r\nline1\nline2\ntail\r\n")]);
+        edit(&d, json!({"edits": [{"path": "mix.txt", "hunks": [{"target": "line1\nline2", "replacement": "L1\nL2\nL3"}]}]})).unwrap();
+        assert_eq!(read(&d, "mix.txt"), "head\r\nL1\nL2\nL3\ntail\r\n");
+    }
+
+    #[test]
+    fn mid_batch_write_failure_rolls_back_and_reports_rollback_errors() {
+        let d = setup(&[("a.txt", "old\n")]);
+        let a_path = d.path().join("a.txt");
+        let a_perms = fs::metadata(&a_path).unwrap().permissions();
+        let created = d.path().join("new.txt");
+        let blocker = d.path().join("blocker");
+        fs::create_dir(&blocker).unwrap();
+        let plans = vec![
+            Plan { display: "a.txt".into(), path: a_path.clone(), new: b"new\n".to_vec(), old: Some((b"old\n".to_vec(), a_perms)), summary: String::new() },
+            Plan { display: "new.txt".into(), path: created.clone(), new: b"hi\n".to_vec(), old: None, summary: String::new() },
+            Plan { display: "blocker".into(), path: blocker.clone(), new: b"x".to_vec(), old: None, summary: String::new() },
+        ];
+        let err = commit(&plans, false, &mut Vec::new()).err().unwrap();
+        assert!(err.contains("rolled back 2 file(s) (0 files modified)"), "{err}");
+        assert_eq!(read(&d, "a.txt"), "old\n");
+        assert!(!created.exists());
+
+        // Duplicate created path forces second rollback's remove_file to fail.
+        let dup = d.path().join("dup.txt");
+        let rb_plans = vec![
+            Plan { display: "dup.txt".into(), path: dup.clone(), new: b"1".to_vec(), old: None, summary: String::new() },
+            Plan { display: "dup.txt".into(), path: dup, new: b"2".to_vec(), old: None, summary: String::new() },
+            Plan { display: "blocker".into(), path: blocker, new: b"x".to_vec(), old: None, summary: String::new() },
+        ];
+        let rb_err = commit(&rb_plans, false, &mut Vec::new()).err().unwrap();
+        assert!(rb_err.contains("rollback failed") && rb_err.contains("dup.txt"), "{rb_err}");
+        assert!(!rb_err.contains("0 files modified") && !rb_err.contains("left unchanged"), "{rb_err}");
+    }
+
+    #[test]
+    fn post_edit_verify_reports_pass_and_fail() {
+        let d = setup(&[("v.txt", "one\n")]);
+        let pass = edit(&d, json!({"edits": [{"path": "v.txt", "hunks": [{"target": "one", "replacement": "two"}]}], "verify": "echo verify-ok"})).unwrap();
+        assert!(pass.contains("v.txt: updated") && pass.contains("PASS"), "{pass}");
+        let fail = edit(&d, json!({"edits": [{"path": "v.txt", "hunks": [{"target": "two", "replacement": "three"}]}], "verify": "exit 1"})).unwrap();
+        assert!(fail.contains("v.txt: updated") && fail.contains("FAIL"), "{fail}");
+        assert_eq!(read(&d, "v.txt"), "three\n");
     }
 }

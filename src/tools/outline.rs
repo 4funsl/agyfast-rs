@@ -2,7 +2,7 @@
 //! scanner for Markdown, unsupported extensions and parse/query failures.
 
 use crate::core::{budget, cwd};
-use crate::tools::slices::slice_file;
+use crate::tools::slices::slice_text;
 use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::Value;
@@ -69,8 +69,12 @@ pub fn outline_file(path: &Path, shown: &str) -> String {
         Err(e) if e.starts_with("skipped") => return format!("## {shown} ({e})"),
         Err(e) => return format!("## {shown}\nERROR: {e}"),
     };
+    outline_text(path, shown, &src)
+}
+
+fn outline_text(path: &Path, shown: &str, src: &str) -> String {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    let rows = outline_source(&ext, &src);
+    let rows = outline_source(&ext, src);
     let body = if rows.is_empty() { "(no symbols detected)".to_string() } else { rows.join("\n") };
     format!("## {shown} ({} lines)\n{body}", src.lines().count())
 }
@@ -81,10 +85,10 @@ fn definitions(path: &Path, shown: &str, names: &[String]) -> String {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let Ok(src) = read_text(path) else { return outline_file(path, shown) };
     let Some((lang, query)) = spec(&ext) else {
-        return format!("No grammar for `.{ext}` files, so names can't be looked up; outline follows:\n{}", outline_file(path, shown));
+        return format!("No grammar for `.{ext}` files, so names can't be looked up; outline follows:\n{}", outline_text(path, shown, &src));
     };
-    let Some(entries) = tree_entries(&lang, query, &src) else {
-        return format!("Could not parse {shown}; outline follows:\n{}", outline_file(path, shown));
+    let Some(entries) = tree_entries(lang, query, &src) else {
+        return format!("Could not parse {shown}; outline follows:\n{}", outline_text(path, shown, &src));
     };
     let lines: Vec<&str> = src.lines().collect();
     let mut ranges = Vec::new();
@@ -117,44 +121,55 @@ fn definitions(path: &Path, shown: &str, names: &[String]) -> String {
             missing.push(format!("`{name}`"));
         }
     }
-    let note = format!("No definition named {} in {shown}; outline follows:\n{}", missing.join(", "), outline_file(path, shown));
+    let note = || format!("No definition named {} in {shown}; outline follows:\n{}", missing.join(", "), outline_text(path, shown, &src));
     match (ranges.is_empty(), missing.is_empty()) {
-        (true, _) => note,
-        (false, true) => slice_file(path, shown, &ranges),
-        (false, false) => format!("{}\n{note}", slice_file(path, shown, &ranges)),
+        (true, _) => note(),
+        (false, true) => slice_text(shown, &src, &ranges),
+        (false, false) => format!("{}\n{}", slice_text(shown, &src, &ranges), note()),
     }
 }
 
 fn outline_source(ext: &str, src: &str) -> Vec<String> {
     if let Some((lang, query)) = spec(ext)
-        && let Some(rows) = tree_outline(&lang, query, src)
+        && let Some(rows) = tree_outline(lang, query, src)
     {
         return rows;
     }
     if matches!(ext, "md" | "markdown" | "mdx") { markdown_outline(src) } else { scan_outline(src) }
 }
 
-/// The `LangSpec` table: grammar plus embedded query, each behind its feature.
-fn spec(ext: &str) -> Option<(tree_sitter::Language, &'static str)> {
+/// The `LangSpec` table: grammar plus compiled query, cached per language.
+fn spec(ext: &str) -> Option<&'static (tree_sitter::Language, tree_sitter::Query)> {
+    #[allow(unused_macros)]
+    macro_rules! cache {
+        ($lang:expr, $query:expr) => {{
+            static CELL: std::sync::OnceLock<Option<(tree_sitter::Language, tree_sitter::Query)>> = std::sync::OnceLock::new();
+            CELL.get_or_init(|| {
+                let lang: tree_sitter::Language = $lang.into();
+                let query = tree_sitter::Query::new(&lang, $query).ok()?;
+                Some((lang, query))
+            }).as_ref()
+        }};
+    }
     match ext {
         #[cfg(feature = "lang-rust")]
-        "rs" => Some((tree_sitter_rust::LANGUAGE.into(), include_str!("../../queries/rust.scm"))),
+        "rs" => cache!(tree_sitter_rust::LANGUAGE, include_str!("../../queries/rust.scm")),
         #[cfg(feature = "lang-ts")]
-        "ts" | "mts" | "cts" => Some((tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), include_str!("../../queries/typescript.scm"))),
+        "ts" | "mts" | "cts" => cache!(tree_sitter_typescript::LANGUAGE_TYPESCRIPT, include_str!("../../queries/typescript.scm")),
         #[cfg(feature = "lang-ts")]
-        "tsx" => Some((tree_sitter_typescript::LANGUAGE_TSX.into(), include_str!("../../queries/typescript.scm"))),
+        "tsx" => cache!(tree_sitter_typescript::LANGUAGE_TSX, include_str!("../../queries/typescript.scm")),
         #[cfg(feature = "lang-ts")]
-        "js" | "jsx" | "mjs" | "cjs" => Some((tree_sitter_javascript::LANGUAGE.into(), include_str!("../../queries/javascript.scm"))),
+        "js" | "jsx" | "mjs" | "cjs" => cache!(tree_sitter_javascript::LANGUAGE, include_str!("../../queries/javascript.scm")),
         #[cfg(feature = "lang-python")]
-        "py" | "pyi" => Some((tree_sitter_python::LANGUAGE.into(), include_str!("../../queries/python.scm"))),
+        "py" | "pyi" => cache!(tree_sitter_python::LANGUAGE, include_str!("../../queries/python.scm")),
         #[cfg(feature = "lang-go")]
-        "go" => Some((tree_sitter_go::LANGUAGE.into(), include_str!("../../queries/go.scm"))),
+        "go" => cache!(tree_sitter_go::LANGUAGE, include_str!("../../queries/go.scm")),
         #[cfg(feature = "lang-config")]
-        "json" | "jsonc" => Some((tree_sitter_json::LANGUAGE.into(), include_str!("../../queries/json.scm"))),
+        "json" | "jsonc" => cache!(tree_sitter_json::LANGUAGE, include_str!("../../queries/json.scm")),
         #[cfg(feature = "lang-config")]
-        "toml" => Some((tree_sitter_toml_ng::LANGUAGE.into(), include_str!("../../queries/toml.scm"))),
+        "toml" => cache!(tree_sitter_toml_ng::LANGUAGE, include_str!("../../queries/toml.scm")),
         #[cfg(feature = "lang-config")]
-        "yaml" | "yml" => Some((tree_sitter_yaml::LANGUAGE.into(), include_str!("../../queries/yaml.scm"))),
+        "yaml" | "yml" => cache!(tree_sitter_yaml::LANGUAGE, include_str!("../../queries/yaml.scm")),
         _ => None,
     }
 }
@@ -191,23 +206,26 @@ struct Entry {
     collapse: Option<bool>,
 }
 
-fn tree_outline(lang: &tree_sitter::Language, query_src: &str, src: &str) -> Option<Vec<String>> {
-    tree_entries(lang, query_src, src).map(render)
+fn tree_outline(lang: &tree_sitter::Language, query: &tree_sitter::Query, src: &str) -> Option<Vec<String>> {
+    tree_entries(lang, query, src).map(render)
 }
 
 /// Definitions as (first line, last line, one-line signature), sorted by start,
 /// for files a grammar supports; empty for other files or on any failure.
 pub fn symbols(path: &Path) -> Vec<(usize, usize, String)> {
+    let Ok(src) = read_text(path) else { return Vec::new() };
+    symbols_in(path, &src)
+}
+
+pub(crate) fn symbols_in(path: &Path, src: &str) -> Vec<(usize, usize, String)> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let Some((lang, query)) = spec(&ext) else { return Vec::new() };
-    let Ok(src) = read_text(path) else { return Vec::new() };
-    let entries = tree_entries(&lang, query, &src).unwrap_or_default();
+    let entries = tree_entries(lang, query, src).unwrap_or_default();
     entries.into_iter().filter(|e| e.collapse.is_none()).map(|e| (e.lines.0, e.lines.1, e.text)).collect()
 }
 
-fn tree_entries(lang: &tree_sitter::Language, query_src: &str, src: &str) -> Option<Vec<Entry>> {
+fn tree_entries(lang: &tree_sitter::Language, query: &tree_sitter::Query, src: &str) -> Option<Vec<Entry>> {
     use tree_sitter::StreamingIterator;
-    let query = tree_sitter::Query::new(lang, query_src).ok()?;
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(lang).ok()?;
     let tree = parser.parse(src, None)?;
@@ -218,7 +236,7 @@ fn tree_entries(lang: &tree_sitter::Language, query_src: &str, src: &str) -> Opt
     let mut items: HashMap<usize, (tree_sitter::Node, Option<usize>)> = HashMap::new();
     let mut entries = Vec::new();
     let mut cursor = tree_sitter::QueryCursor::new();
-    let mut matches = cursor.matches(&query, tree.root_node(), src.as_bytes());
+    let mut matches = cursor.matches(query, tree.root_node(), src.as_bytes());
     while let Some(m) = matches.next() {
         let of = |i| m.captures().iter().filter(move |c| Some(c.index) == i).map(|c| c.node);
         let coll: Vec<_> = of(coll_i).collect();
@@ -413,10 +431,7 @@ mod tests {
             ("yaml", "on:\n  push:\n    branches: [main]\njobs:\n  build: {}\n", "  L5 build: {}"),
         ];
         for (ext, src, want) in cases {
-            let (lang, q) = spec(ext).unwrap();
-            if let Err(e) = tree_sitter::Query::new(&lang, q) {
-                panic!("{ext} query: {e}");
-            }
+            assert!(spec(ext).is_some(), "{ext} grammar/query failed");
             let got = outline(ext, src);
             assert!(got.lines().any(|l| l == *want), "{ext}: want {want:?} in\n{got}");
         }
