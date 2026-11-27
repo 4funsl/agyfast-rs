@@ -14,6 +14,7 @@ const HELP: &str = r#"agyfast-rs cli <tool> [--cwd DIR] [--max-chars N] [--json 
   slices   [--outline FILE]... FILE:START-END[,START-END]...
   edit     [--best-effort] [--dry-run] [--verify CMD] [--verify-timeout S] [--max-verify-chars N] --stdin   ({"edits":[...]} on stdin)
   check    [--compact|--full] [--concurrency N] [--timeout S] "CMD"...
+           A completed check report exits 0 even when a child fails. Failed checks report their own status.
   filter   "CMD"   compress CMD's output read from stdin (runs nothing); first line [agyfast-rs PASS|FAIL],
                    exit 1 when the output shows failure (used by `agyfast-rs hook pre-bash`)
   snapshot
@@ -148,11 +149,7 @@ fn read_bounded(mut r: impl Read) -> std::io::Result<Vec<u8>> {
             s = &s[take..];
         }
         if !s.is_empty() {
-            if s.len() >= FILTER_TAIL {
-                tail.clear();
-                tail.extend_from_slice(&s[s.len() - FILTER_TAIL..]);
-                tail_pos = 0;
-            } else if tail.len() < FILTER_TAIL {
+            if tail.len() < FILTER_TAIL {
                 let take = (FILTER_TAIL - tail.len()).min(s.len());
                 tail.extend_from_slice(&s[..take]);
                 let rem = &s[take..];
@@ -205,9 +202,13 @@ pub fn run(args: &[String]) -> i32 {
             };
         }
         Some("filter") => {
-            let [_, command] = args else {
-                eprintln!("{HELP}");
-                return 2;
+            let (command, framed) = match args {
+                [_, command] => (command, false),
+                [_, flag, command] if flag == "--framed" => (command, true),
+                _ => {
+                    eprintln!("{HELP}");
+                    return 2;
+                }
             };
             let raw = match read_bounded(std::io::stdin().lock()) {
                 Ok(raw) => raw,
@@ -216,9 +217,22 @@ pub fn run(args: &[String]) -> i32 {
                     return 1;
                 }
             };
-            let (text, failed) = tools::check::filter(command, &String::from_utf8_lossy(&raw));
+            let (raw, status) = if framed {
+                let frame = raw.iter().rposition(|&b| b == 0).and_then(|i| {
+                    let code = std::str::from_utf8(&raw[i + 1..]).ok()?.parse::<u8>().ok()?;
+                    Some((&raw[..i], Some(code)))
+                });
+                let Some(frame) = frame else {
+                    eprintln!("Error: missing check exit status");
+                    return 1;
+                };
+                frame
+            } else {
+                (raw.as_slice(), None)
+            };
+            let (text, failed) = tools::check::filter(command, &String::from_utf8_lossy(raw), status);
             println!("{text}");
-            return i32::from(failed);
+            return i32::from(status.unwrap_or(u8::from(failed)));
         }
         Some("worker-brief") => {
             return match worker_brief() {

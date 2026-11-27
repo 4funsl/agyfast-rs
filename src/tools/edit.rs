@@ -139,16 +139,15 @@ fn window(starts: &[usize], len: usize, s: Option<usize>, e: Option<usize>) -> R
 }
 
 fn plan_hunks(display: &str, content: &str, hunks: &[&Hunk]) -> Result<(String, String), String> {
-    let crlf = content.contains("\r\n");
-    let fix = |s: &str| {
-        let s = s.replace("\r\n", "\n");
-        if crlf { s.replace('\n', "\r\n") } else { s }
-    };
-    let starts: Vec<usize> = std::iter::once(0).chain(content.match_indices('\n').map(|(i, _)| i + 1)).collect();
+    let crs: Vec<_> = content.match_indices("\r\n").enumerate().map(|(i, (o, _))| o - i).collect();
+    let normalized = if crs.is_empty() { std::borrow::Cow::Borrowed(content) } else { std::borrow::Cow::Owned(content.replace("\r\n", "\n")) };
+    // CRs before a logical offset are the extra bytes at its on-disk position.
+    let original = |o| o + crs.partition_point(|&cr| cr < o);
+    let starts: Vec<_> = std::iter::once(0).chain(normalized.match_indices('\n').map(|(i, _)| i + 1)).collect();
     let mut spans = Vec::new();
     let mut errors = Vec::new();
     for (i, h) in hunks.iter().enumerate() {
-        let (mut t, mut r) = (fix(&h.target), fix(&h.replacement));
+        let (t, r) = (h.target.replace("\r\n", "\n"), h.replacement.replace("\r\n", "\n"));
         let err = |m: String| format!("{display} hunk #{}: {m}", i + 1);
         if t.is_empty() {
             errors.push(err("empty target".into()));
@@ -158,26 +157,26 @@ fn plan_hunks(display: &str, content: &str, hunks: &[&Hunk]) -> Result<(String, 
             errors.push(err("replacement equals target (no-op)".into()));
             continue;
         }
-        let (ws, we) = match window(&starts, content.len(), h.start_line, h.end_line) {
+        let (ws, we) = match window(&starts, normalized.len(), h.start_line, h.end_line) {
             Ok(w) => w,
             Err(m) => {
                 errors.push(err(m));
                 continue;
             }
         };
-        let mut found: Vec<usize> = content[ws..we].match_indices(&t).map(|(o, _)| o + ws).collect();
-        if found.is_empty() && crlf && h.target.contains('\n') && !h.target.contains("\r\n") && content[ws..we].contains(&h.target) {
-            t = h.target.clone();
-            r = h.replacement.replace("\r\n", "\n");
-            found = content[ws..we].match_indices(&t).map(|(o, _)| o + ws).collect();
+        let region = &normalized[ws..we];
+        let found: Vec<_> = region.match_indices(&t).map(|(o, _)| ws + o).collect();
+        if !h.replace_all && let [first] = found.as_slice() && region.rfind(&t) != Some(first - ws) {
+            errors.push(err("target has overlapping matches. Add more context or use replaceAll: true.".into()));
+            continue;
         }
         let ranged = h.start_line.is_some() || h.end_line.is_some();
         match found.len() {
             0 => {
                 let outside: Vec<String> =
-                    content.match_indices(&t).take(3).map(|(o, _)| line_range(&starts, o, t.len())).collect();
+                    normalized.match_indices(&t).take(3).map(|(o, _)| line_range(&starts, o, t.len())).collect();
                 let hint = if outside.is_empty() {
-                    closest(content, &t)
+                    closest(&normalized, &t)
                 } else {
                     format!(" Exact match found outside range at {} (adjust or omit startLine/endLine).", outside.join(", "))
                 };
@@ -191,13 +190,19 @@ fn plan_hunks(display: &str, content: &str, hunks: &[&Hunk]) -> Result<(String, 
                     at.join(", ")
                 )));
             }
-            _ => spans.extend(found.into_iter().map(|o| (o, o + t.len(), r.clone(), i))),
+            _ => spans.extend(found.into_iter().map(|o| {
+                let (s, e) = (original(o), original(o + t.len()));
+                let line = line_of(&starts, o);
+                let line_end = starts.get(line).or_else(|| starts.get(line - 1));
+                let crlf = line_end.is_some_and(|&end| end > 0 && crs.binary_search(&(end - 1)).is_ok());
+                (s, e, if crlf { r.replace('\n', "\r\n") } else { r.clone() }, i, o)
+            })),
         }
     }
     spans.sort_by_key(|s| (s.0, s.1));
     for w in spans.windows(2) {
         if w[1].0 < w[0].1 {
-            errors.push(format!("{display}: hunk #{} and hunk #{} overlap near line {}", w[0].3 + 1, w[1].3 + 1, line_of(&starts, w[1].0)));
+            errors.push(format!("{display}: hunk #{} and hunk #{} overlap near line {}", w[0].3 + 1, w[1].3 + 1, line_of(&starts, w[1].4)));
         }
     }
     if !errors.is_empty() {
@@ -205,7 +210,7 @@ fn plan_hunks(display: &str, content: &str, hunks: &[&Hunk]) -> Result<(String, 
     }
     let mut out = String::with_capacity(content.len());
     let mut cursor = 0;
-    for (s, e, r, _) in &spans {
+    for (s, e, r, _, _) in &spans {
         out.push_str(&content[cursor..*s]);
         out.push_str(r);
         cursor = *e;
@@ -279,6 +284,18 @@ fn write_atomic(path: &Path, bytes: &[u8], perms: Option<&Permissions>, #[cfg_at
     #[cfg(unix)]
     builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o666)); // new files honour umask
     let mut tmp = builder.tempfile_in(dir)?;
+    #[cfg(windows)]
+    if perms.is_some() {
+        // CopyFileEx preserves named streams. Rewrite only the unnamed stream.
+        fs::copy(path, tmp.path())?;
+        if let Some(p) = perms.filter(|p| p.readonly()) {
+            let mut writable = p.clone();
+            #[allow(clippy::permissions_set_readonly_false)]
+            writable.set_readonly(false);
+            tmp.as_file().set_permissions(writable)?;
+        }
+        tmp.as_file().set_len(0)?;
+    }
     tmp.write_all(bytes)?;
     #[cfg(not(windows))]
     if let Some(p) = perms {
@@ -495,6 +512,22 @@ mod tests {
     const DUP: &str = "fn one() {\n  return value;\n}\nfn two() {\n  return value;\n}\n";
 
     #[test]
+    fn overlapping_matches_and_mixed_line_endings() {
+        let d = setup(&[("a", "aaa"), ("mixed", "a\r\nb\r\na\nb\nlast")]);
+        let h = |path, target, replacement, all| json!({"edits": [{"path": path, "hunks": [
+            {"target": target, "replacement": replacement, "replaceAll": all}
+        ]}]});
+        assert!(edit(&d, h("a", "aa", "X", false)).unwrap_err().contains("overlapping matches"));
+        assert_eq!(read(&d, "a"), "aaa");
+        edit(&d, h("a", "aa", "X", true)).unwrap();
+        assert_eq!(read(&d, "a"), "Xa");
+        assert!(edit(&d, h("mixed", "a\nb", "X\nY", false)).unwrap_err().contains("matched 2 times"));
+        edit(&d, h("mixed", "a\nb", "X\nY", true)).unwrap();
+        edit(&d, h("mixed", "last", "last\nline", false)).unwrap();
+        assert_eq!(read(&d, "mixed"), "X\r\nY\r\nX\nY\nlast\nline");
+    }
+
+    #[test]
     fn unique_ambiguous_missing_and_window() {
         let d = setup(&[("a.rs", DUP)]);
         let h = |t: &str, extra: Value| {
@@ -630,6 +663,8 @@ mod tests {
     fn mid_batch_write_failure_rolls_back_and_reports_rollback_errors() {
         let d = setup(&[("a.txt", "old\n")]);
         let a_path = d.path().join("a.txt");
+        #[cfg(windows)]
+        fs::write(d.path().join("a.txt:rollback"), "kept").unwrap();
         let a_perms = fs::metadata(&a_path).unwrap().permissions();
         let created = d.path().join("new.txt");
         let blocker = d.path().join("blocker");
@@ -643,6 +678,8 @@ mod tests {
         assert!(err.contains("rolled back 2 file(s) (0 files modified)"), "{err}");
         assert_eq!(read(&d, "a.txt"), "old\n");
         assert!(!created.exists());
+        #[cfg(windows)]
+        assert_eq!(read(&d, "a.txt:rollback"), "kept");
 
         // Duplicate created path forces second rollback's remove_file to fail.
         let dup = d.path().join("dup.txt");

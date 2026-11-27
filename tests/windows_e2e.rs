@@ -37,6 +37,7 @@ fn cli_and_hooks_accept_double_utf8_bom_and_enforce_plugin_root() {
     let dir = tempfile::tempdir().unwrap();
     let ro = dir.path().join("ro.txt");
     fs::write(&ro, "old\n").unwrap();
+    fs::write(dir.path().join("ro.txt:metadata"), "kept").unwrap();
     set_readonly(&ro, true);
 
     let edit_payload = bom_json(json!({
@@ -47,6 +48,7 @@ fn cli_and_hooks_accept_double_utf8_bom_and_enforce_plugin_root() {
     assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert_eq!(fs::read_to_string(&ro).unwrap(), "new\n");
     assert!(fs::metadata(&ro).unwrap().permissions().readonly(), "ReadOnly attribute was lost");
+    assert_eq!(fs::read(dir.path().join("ro.txt:metadata")).unwrap(), b"kept");
     set_readonly(&ro, false);
 
     let hook_ss = bom_json(json!({"hookEventName": "SessionStart", "workspacePaths": [dir.path()]}));
@@ -80,6 +82,7 @@ fn edit_preserves_readonly_overwrite_crlf_and_ntfs_case_dedup() {
 
     let ro_over = dir.path().join("ro_over.txt");
     fs::write(&ro_over, "v1\n").unwrap();
+    fs::write(dir.path().join("ro_over.txt:metadata"), "kept").unwrap();
     set_readonly(&ro_over, true);
     let over_out = run_with_stdin(
         &["cli", "edit", "--cwd", dir.path().to_str().unwrap(), "--stdin"],
@@ -90,6 +93,7 @@ fn edit_preserves_readonly_overwrite_crlf_and_ntfs_case_dedup() {
     assert!(over_out.status.success(), "{}", String::from_utf8_lossy(&over_out.stdout));
     assert_eq!(fs::read_to_string(&ro_over).unwrap(), "v2\n");
     assert!(fs::metadata(&ro_over).unwrap().permissions().readonly());
+    assert_eq!(fs::read(dir.path().join("ro_over.txt:metadata")).unwrap(), b"kept");
     set_readonly(&ro_over, false);
 
     let crlf = dir.path().join("crlf.txt");
@@ -151,6 +155,15 @@ fn checks_preserve_non_ascii_backslashes_ntstatus_and_posix_sh() {
     let na_out = String::from_utf8_lossy(&non_ascii.stdout);
     assert!(na_out.contains("[PASS") && na_out.contains("marker_ok"), "{na_out}");
 
+    let escaped = "echo one ^&& echo two";
+    let native = Command::new("cmd").args(["/D", "/C", escaped]).output().unwrap();
+    let wrapped = Command::new(BIN).args(["cli", "check", "--cwd", cwd, "--full", escaped]).output().unwrap();
+    let report = String::from_utf8_lossy(&wrapped.stdout);
+    assert!(native.status.success() && report.contains("[PASS"), "{report}");
+    for line in String::from_utf8_lossy(&native.stdout).lines() {
+        assert!(report.lines().any(|l| l.trim() == line.trim()), "{report}");
+    }
+
     let nt = Command::new(BIN)
         .args(["cli", "check", "--cwd", cwd, "exit -1073741819", "exit -1073741502"])
         .output()
@@ -182,6 +195,39 @@ fn checks_preserve_non_ascii_backslashes_ntstatus_and_posix_sh() {
         assert!(sh_out.status.success());
         let sh_text = String::from_utf8_lossy(&sh_out.stdout);
         assert!(sh_text.contains("Checks: 2/2 passed") && sh_text.contains("hello world"), "{sh_text}");
+    }
+}
+
+#[test]
+fn search_reports_exclusive_lock_alongside_readable_hits() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let locked = dir.path().join("busy.txt");
+    fs::write(&locked, "needle\n").unwrap();
+    fs::write(dir.path().join("match.txt"), "needle\n").unwrap();
+    fs::write(dir.path().join("binary"), b"needle\0").unwrap();
+    let _handle = fs::OpenOptions::new().read(true).share_mode(0).open(locked).unwrap();
+    for mode in ["content", "files_with_matches", "count"] {
+        let result = run_with_stdin(&["cli", "search", "--output-mode", mode, "--text", "needle"], dir.path(), b"", &[]);
+        let text = String::from_utf8_lossy(&result.stdout);
+        assert!(result.status.success() && text.contains("Incomplete search: 1 unreadable file") && text.contains("match.txt") && !text.contains("binary"), "{text}");
+    }
+}
+
+#[test]
+fn bash_hook_obeys_child_status() {
+    let bash = std::env::var_os("ProgramFiles").map(PathBuf::from).map(|d| d.join(r"Git\bin\bash.exe"));
+    let Some(bash) = bash.filter(|p| p.is_file()) else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let input = json!({"tool_name": "Bash", "tool_input": {"command": "pytest && touch continued"}});
+    let hook = run_with_stdin(&["hook", "pre-bash"], dir.path(), input.to_string().as_bytes(), &[]);
+    let response: Value = serde_json::from_slice(&hook.stdout).unwrap();
+    let command = response["hookSpecificOutput"]["updatedInput"]["command"].as_str().unwrap();
+    for (body, code, verdict) in [("return 5", 5, "FAIL"), ("printf '1 failed'; return 0", 0, "PASS")] {
+        let output = Command::new(&bash).args(["-c", &format!("pytest() {{ {body}; }}; {command}")]).current_dir(dir.path()).output().unwrap();
+        assert_eq!(output.status.code(), Some(code), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains(&format!("[agyfast-rs {verdict}]")));
+        assert_eq!(dir.path().join("continued").exists(), code == 0);
     }
 }
 

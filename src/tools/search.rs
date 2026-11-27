@@ -72,14 +72,19 @@ pub fn run(args: Value) -> Result<String, String> {
         .par_iter()
         .enumerate()
         .map(|(i, q)| {
-            let header = format!(
+            let mut header = format!(
                 "## Query {} [{}] {}{}",
                 i + 1,
                 q.kind,
                 q.pattern,
                 q.path.as_deref().map(|p| format!(" (in {p})")).unwrap_or_default()
             );
-            (header, run_query(q, &base).unwrap_or_else(|e| Body::Text(format!("Error: {e}"))))
+            let mut unreadable = 0;
+            let body = run_query(q, &base, &mut unreadable).unwrap_or_else(|e| Body::Text(format!("Error: {e}")));
+            if unreadable > 0 {
+                header.push_str(&format!("\nIncomplete search: {unreadable} unreadable file(s)."));
+            }
+            (header, body)
         })
         .collect();
     let lens: Vec<usize> = parts.iter().map(|(h, b)| h.len() + 1 + b.full_len()).collect();
@@ -140,7 +145,7 @@ fn fit_list(items: &[String], total: usize, what: &str, room: usize) -> String {
     out.join("\n")
 }
 
-fn run_query(q: &Query, base: &Path) -> Result<Body, String> {
+fn run_query(q: &Query, base: &Path, unreadable: &mut usize) -> Result<Body, String> {
     if q.pattern.trim().is_empty() {
         return Err("pattern must not be empty".into());
     }
@@ -166,7 +171,7 @@ fn run_query(q: &Query, base: &Path) -> Result<Body, String> {
             let paths: Vec<_> = scored.into_iter().map(|(_, p)| PathBuf::from(p)).collect();
             Ok(list(&paths, base, q.max_results.unwrap_or(30)))
         }
-        "text" | "regex" => search(q, &root, base),
+        "text" | "regex" => search(q, &root, base, unreadable),
         other => Err(format!("unknown query type `{other}` (text, regex, glob, fuzzy, git)")),
     }
 }
@@ -318,7 +323,7 @@ fn snippet(matcher: &RegexMatcher, line: &str, is_match: bool) -> String {
     format!("{}{}{}", if start > 0 { "..." } else { "" }, &line[start..end], if end < line.len() { "..." } else { "" })
 }
 
-fn search(q: &Query, root: &Path, base: &Path) -> Result<Body, String> {
+fn search(q: &Query, root: &Path, base: &Path, unreadable: &mut usize) -> Result<Body, String> {
     let mode = q.output_mode.as_deref().unwrap_or("content");
     if !["content", "files_with_matches", "count"].contains(&mode) {
         return Err(format!("invalid outputMode `{mode}`"));
@@ -338,22 +343,28 @@ fn search(q: &Query, root: &Path, base: &Path) -> Result<Body, String> {
     }
     let matcher = mb.build(&q.pattern).map_err(|e| format!("invalid {} pattern: {e}", q.kind))?;
     let files = walk(root, q, true)?;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let errors = AtomicUsize::new(0);
     let hits: Vec<(PathBuf, Collect)> = files
         .into_par_iter()
         .filter_map(|f| {
             let mut sink =
                 Collect { matcher: &matcher, cap: max, lines: Vec::new(), stored: 0, count: 0, closed: false, binary: false };
-            SearcherBuilder::new()
+            if SearcherBuilder::new()
                 .binary_detection(BinaryDetection::quit(0))
                 .multi_line(q.multiline)
                 .before_context(ctx)
                 .after_context(ctx)
                 .build()
                 .search_path(&matcher, &f, &mut sink)
-                .ok()?;
+                .is_err() {
+                errors.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
             (sink.count > 0 && !sink.binary).then_some((f, sink))
         })
         .collect();
+    *unreadable = errors.into_inner();
     if hits.is_empty() {
         return Ok(Body::Text("(no matches)".into()));
     }
@@ -1091,8 +1102,8 @@ mod tests {
         let out = call(dir.path(), json!([{"type": "text", "pattern": "hit", "definition": true, "contextLines": 3}]));
         if cfg!(feature = "lang-rust") {
             assert_eq!(out, "## Query 1 [text] hit\na.rs\n L1-5 fn first()\n 1- fn first() {\n 2-     let a = 1;\n 3:     hit(a);\n 4:     hit(a);\n 5- }", "{out}");
+            assert!(!out.contains("second") && !out.contains("other"), "{out}");
         }
-        assert!(!out.contains("second") && !out.contains("other"), "{out}");
         // The tip shows for plain content queries only, never for glob-only or all-definition batches.
         let run_tip = |q: Value| run(json!({"cwd": dir.path(), "queries": q})).unwrap().ends_with(TIP);
         assert!(run_tip(json!([{"type": "text", "pattern": "hit"}])));
@@ -1108,9 +1119,9 @@ mod tests {
         fs::write(dir.path().join("a.rs"), format!("fn long() {{\n{body}}}\n")).unwrap(); // 100 lines
         fs::write(dir.path().join("a.txt"), (1..=20).map(|i| format!("t{i}\n")).collect::<String>()).unwrap();
         let out = call(dir.path(), json!([{"type": "text", "pattern": "line50;", "definition": true}]));
-        assert!(out.contains(" 40-     line40;") && out.contains(" 51-     line51;") && out.contains(" 60-     line60;"), "{out}");
-        assert!(!out.contains(" 39-") && !out.contains(" 61-"), "{out}");
         if cfg!(feature = "lang-rust") {
+            assert!(out.contains(" 40-     line40;") && out.contains(" 51-     line51;") && out.contains(" 60-     line60;"), "{out}");
+            assert!(!out.contains(" 39-") && !out.contains(" 61-"), "{out}");
             assert!(out.contains(" L1-100 fn long()"), "{out}");
         }
         let out = call(dir.path(), json!([{"type": "text", "pattern": "t10", "definition": true}]));
@@ -1125,6 +1136,9 @@ mod tests {
         let out = run(json!({"cwd": dir.path(), "queries": [{"type": "text", "pattern": "hit", "definition": true}], "maxChars": 500})).unwrap();
         assert!(out.len() <= 500, "{}", out.len());
 
+        if !cfg!(feature = "lang-rust") {
+            return;
+        }
         // An oversized first definition still returns >= 1 hit folded to budget, and skips to smaller files when any fit.
         let big: String = (0..40).map(|i| format!("    let x{i} = \"{}\";\n", "y".repeat(30))).collect();
         fs::write(dir.path().join("a.rs"), format!("fn huge0() {{\n{big}    hit();\n}}\nfn huge1() {{\n{big}    hit();\n}}\n")).unwrap();

@@ -244,6 +244,10 @@ enum Step<'a> {
 /// shell: anything but top-level `&&` between simple commands (see `and_parts`),
 /// or a step that changes shell state other than a plain `cd DIR`.
 fn split_chain(command: &str) -> Option<Vec<Step<'_>>> {
+    #[cfg(windows)]
+    if command.contains('^') && !(needs_sh(command) && find_sh().is_some()) {
+        return None;
+    }
     chain_steps(and_parts(command, false).filter(|p| p.len() >= 2)?, cfg!(windows))
 }
 
@@ -348,7 +352,7 @@ fn filterable(step: &str) -> bool {
 }
 
 /// `command` with each filterable step of a plain command or `&&` chain turned
-/// into `STEP 2>&1 | EXE cli filter 'STEP'` (cargo builds get JSON diagnostics);
+/// into a pipeline carrying output and a NUL-delimited exit code (cargo builds get JSON diagnostics);
 /// other steps stay as written. A trailing `2>&1` on a step is dropped (the
 /// rewrite adds its own); any other redirection or pipe leaves the command alone.
 /// `None` when nothing would change.
@@ -365,7 +369,7 @@ fn rewrite(command: &str, exe: &str) -> Option<String> {
         .map(|&p| match filterable(p) {
             true => {
                 let p = p.strip_suffix("2>&1").map_or(p, str::trim_end);
-                format!("{} 2>&1 | {exe} cli filter {}", inject_json(p).as_deref().unwrap_or(p), sh_quote(p))
+                format!(r#"{{ if {}; then printf '\0%s' 0; else printf '\0%s' "$?"; fi; }} 2>&1 | {exe} cli filter --framed {}"#, inject_json(p).as_deref().unwrap_or(p), sh_quote(p))
             }
             false => p.to_string(),
         })
@@ -401,11 +405,10 @@ pub fn pre_bash_hook() {
 }
 
 /// `agyfast-rs cli filter`: compress `raw`, the captured output of `command`, under a
-/// status line; `true` when the output shows failure. The exit code is lost in
-/// the pipe, so failure is read from the content.
-pub fn filter(command: &str, raw: &str) -> (String, bool) {
+/// status line. A hook supplies the child status; a manual pipeline uses output heuristics.
+pub fn filter(command: &str, raw: &str, status: Option<u8>) -> (String, bool) {
     let (k, out) = (kind(command), clean(raw));
-    let failed = failed(k, &out);
+    let failed = status.map(|s| s != 0).or_else(|| failed(k, &out));
     let text = match failed {
         None => format!("[agyfast-rs] {command} (status not judged)\n{}", generic(&out)),
         Some(false) => format!("[agyfast-rs PASS] {command}: {}", summary(&compress(k, &out, budget::CAP))),
@@ -1525,7 +1528,7 @@ error: test failed, to rerun pass `--bin demo`"##;
         assert_eq!(
             out,
             json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": {
-                "command": "cargo check --message-format=json --all-targets 2>&1 | /opt/agy/agyfast-rs cli filter 'cargo check --all-targets'",
+                "command": "{ if cargo check --message-format=json --all-targets; then printf '\\0%s' 0; else printf '\\0%s' \"$?\"; fi; } 2>&1 | /opt/agy/agyfast-rs cli filter --framed 'cargo check --all-targets'",
                 "description": "check", "timeout": 120000, "run_in_background": false, "future_field": {"x": [1]}}}})
         );
         assert!(out["hookSpecificOutput"].get("permissionDecision").is_none());
@@ -1538,20 +1541,20 @@ error: test failed, to rerun pass `--bin demo`"##;
     fn hook_rewrites_each_check_step_of_a_chain() {
         assert_eq!(
             rewritten("cd crates/x && cargo check && cargo test foo").as_deref(),
-            Some("cd crates/x && cargo check --message-format=json 2>&1 | /opt/agy/agyfast-rs cli filter 'cargo check' && cargo test foo 2>&1 | /opt/agy/agyfast-rs cli filter 'cargo test foo'")
+            Some("cd crates/x && { if cargo check --message-format=json; then printf '\\0%s' 0; else printf '\\0%s' \"$?\"; fi; } 2>&1 | /opt/agy/agyfast-rs cli filter --framed 'cargo check' && { if cargo test foo; then printf '\\0%s' 0; else printf '\\0%s' \"$?\"; fi; } 2>&1 | /opt/agy/agyfast-rs cli filter --framed 'cargo test foo'")
         );
         // A trailing 2>&1 is the model's habit, not a wish for raw output; other steps stay as written.
         assert_eq!(
             rewritten("cargo test 2>&1").as_deref(),
-            Some("cargo test 2>&1 | /opt/agy/agyfast-rs cli filter 'cargo test'")
+            Some("{ if cargo test; then printf '\\0%s' 0; else printf '\\0%s' \"$?\"; fi; } 2>&1 | /opt/agy/agyfast-rs cli filter --framed 'cargo test'")
         );
         assert_eq!(
             rewritten("cargo check --all-targets 2>&1 && echo done 2>&1").as_deref(),
-            Some("cargo check --message-format=json --all-targets 2>&1 | /opt/agy/agyfast-rs cli filter 'cargo check --all-targets' && echo done 2>&1")
+            Some("{ if cargo check --message-format=json --all-targets; then printf '\\0%s' 0; else printf '\\0%s' \"$?\"; fi; } 2>&1 | /opt/agy/agyfast-rs cli filter --framed 'cargo check --all-targets' && echo done 2>&1")
         );
         assert_eq!(
             rewritten("cargo run && cargo clippy").as_deref(),
-            Some("cargo run && cargo clippy --message-format=json 2>&1 | /opt/agy/agyfast-rs cli filter 'cargo clippy'")
+            Some("cargo run && { if cargo clippy --message-format=json; then printf '\\0%s' 0; else printf '\\0%s' \"$?\"; fi; } 2>&1 | /opt/agy/agyfast-rs cli filter --framed 'cargo clippy'")
         );
     }
 
@@ -1559,7 +1562,7 @@ error: test failed, to rerun pass `--bin demo`"##;
     #[test]
     fn hook_quotes_the_original_command_for_the_shell() {
         let out = rewritten(r#"cargo test "it's" -- --exact"#).unwrap();
-        assert_eq!(out, r#"cargo test "it's" -- --exact 2>&1 | /opt/agy/agyfast-rs cli filter 'cargo test "it'\''s" -- --exact'"#);
+        assert_eq!(out, r#"{ if cargo test "it's" -- --exact; then printf '\0%s' 0; else printf '\0%s' "$?"; fi; } 2>&1 | /opt/agy/agyfast-rs cli filter --framed 'cargo test "it'\''s" -- --exact'"#);
         // The shell hands the filter the original command back byte for byte.
         let echoed = Command::new("sh").arg("-c").arg(format!("printf %s {}", sh_quote(r#"cargo test "it's" $HOME `x`"#))).output().unwrap();
         assert_eq!(String::from_utf8(echoed.stdout).unwrap(), r#"cargo test "it's" $HOME `x`"#);
@@ -1609,23 +1612,23 @@ error: test failed, to rerun pass `--bin demo`"##;
 
     #[test]
     fn filter_reads_failure_from_the_content() {
-        let (out, failed) = filter("cargo check", CARGO_CHECK);
+        let (out, failed) = filter("cargo check", CARGO_CHECK, None);
         assert!(failed && out.starts_with("[agyfast-rs FAIL] cargo check\nsrc/main.rs:6:18 [E0308]") && out.ends_with("1 error, 1 warning"), "{out}");
-        let (out, failed) = filter("cargo clippy", CARGO_CLIPPY);
+        let (out, failed) = filter("cargo clippy", CARGO_CLIPPY, None);
         assert!(!failed && out == "[agyfast-rs PASS] cargo clippy: 0 errors, 2 warnings", "{out}");
-        let (out, failed) = filter("cargo test", CARGO_TEST);
+        let (out, failed) = filter("cargo test", CARGO_TEST, None);
         assert!(failed && out.contains("test result: FAILED. 1 passed; 1 failed") && !out.contains("ok_one"), "{out}");
-        assert!(filter("go test ./...", GO_TEST).1);
-        assert!(filter("npx tsc --noEmit", "src/a.ts(12,5): error TS2322: Type 'string' is not assignable.").1);
-        assert!(!filter("npx eslint src", "/r/a.ts\n  9:1  warning  x  no-console\n\n✖ 1 problem (0 errors, 1 warning)").1);
-        assert!(!filter("pytest", "===== 3 passed in 0.10s =====").1);
-        assert!(filter("pytest", "FAILED t.py::bad - assert 1\n===== 1 failed, 2 passed in 0.10s =====").1);
+        assert!(filter("go test ./...", GO_TEST, None).1);
+        assert!(filter("npx tsc --noEmit", "src/a.ts(12,5): error TS2322: Type 'string' is not assignable.", None).1);
+        assert!(!filter("npx eslint src", "/r/a.ts\n  9:1  warning  x  no-console\n\n✖ 1 problem (0 errors, 1 warning)", None).1);
+        assert!(!filter("pytest", "===== 3 passed in 0.10s =====", None).1);
+        assert!(filter("pytest", "FAILED t.py::bad - assert 1\n===== 1 failed, 2 passed in 0.10s =====", None).1);
         // Without cargo's JSON (a manifest error), cargo's own error line decides.
-        assert!(filter("cargo check", "error: failed to parse manifest at `/w/Cargo.toml`").1);
+        assert!(filter("cargo check", "error: failed to parse manifest at `/w/Cargo.toml`", None).1);
         let lines: Vec<String> = (1..=500).map(|i| format!("line {i}")).collect();
-        let (out, failed) = filter("make all", &lines.join("\n"));
+        let (out, failed) = filter("make all", &lines.join("\n"), None);
         assert!(!failed && out.starts_with("[agyfast-rs] make all (status not judged)\nline 1\n") && out.ends_with("line 500"), "{out}");
-        assert!(filter("cargo test", &"x".repeat(50_000)).0.len() <= budget::CAP);
+        assert!(filter("cargo test", &"x".repeat(50_000), None).0.len() <= budget::CAP);
     }
 
     #[cfg(unix)] // rustc prints `src\lib.rs` on Windows
@@ -1638,15 +1641,15 @@ error: test failed, to rerun pass `--bin demo`"##;
         let sh = |c: &str| String::from_utf8_lossy(&Command::new("sh").arg("-c").arg(c).current_dir(p).output().unwrap().stdout).into_owned();
         let lib = "pub fn add(a: i32, b: i32) -> i32 { a + b }\n#[test]\nfn good() { assert_eq!(add(1, 2), 3); }\n";
         std::fs::write(p.join("src/lib.rs"), lib).unwrap();
-        let (out, failed) = filter("cargo check", &sh("cargo check --message-format=json 2>&1"));
+        let (out, failed) = filter("cargo check", &sh("cargo check --message-format=json 2>&1"), None);
         assert_eq!((out.as_str(), failed), ("[agyfast-rs PASS] cargo check: 0 errors, 0 warnings", false));
 
         std::fs::write(p.join("src/lib.rs"), format!("{lib}#[test]\nfn bad() {{ assert_eq!(add(2, 2), 5, \"math is broken\"); }}\n")).unwrap();
-        let (out, failed) = filter("cargo test", &sh("cargo test 2>&1"));
+        let (out, failed) = filter("cargo test", &sh("cargo test 2>&1"), None);
         assert!(failed && out.starts_with("[agyfast-rs FAIL] cargo test\n") && out.contains("math is broken") && out.contains("test result: FAILED. 1 passed; 1 failed"), "{out}");
 
         std::fs::write(p.join("src/lib.rs"), "pub fn add(a: i32) -> i32 { let x: i32 = \"five\"; a + x }\n").unwrap();
-        let (out, failed) = filter("cargo check", &sh("cargo check --message-format=json 2>&1"));
+        let (out, failed) = filter("cargo check", &sh("cargo check --message-format=json 2>&1"), None);
         assert!(failed && out.contains("src/lib.rs:1:42 [E0308] mismatched types") && out.ends_with("1 error, 0 warnings"), "{out}");
     }
 
@@ -1797,7 +1800,7 @@ error: test failed, to rerun pass `--bin demo`"##;
             ("go test ./...", "go: cannot find main module, but found .git"),
             ("vitest", "  ✓ handles 1 error 2ms\nTests  1 failed | 1 passed (2)"),
         ] {
-            assert!(filter(cmd, raw).1, "expected fail for `{cmd}` on `{raw}`");
+            assert!(filter(cmd, raw, None).1, "expected fail for `{cmd}` on `{raw}`");
         }
         for (cmd, raw) in [
             ("cargo test", "test tests::test_handles_1_error ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"),
@@ -1806,10 +1809,10 @@ error: test failed, to rerun pass `--bin demo`"##;
             ("go test ./...", "=== RUN   Test_1_error\n--- PASS: Test_1_error (0.00s)\nPASS\nok  \texample.com/x\t0.01s"),
             ("cargo clippy", CARGO_CLIPPY),
         ] {
-            assert!(!filter(cmd, raw).1, "expected pass for `{cmd}` on `{raw}`");
+            assert!(!filter(cmd, raw, None).1, "expected pass for `{cmd}` on `{raw}`");
         }
         let long_cmd = format!("cargo check {}", "a".repeat(9000));
-        let (out, failed) = filter(&long_cmd, CARGO_CHECK);
+        let (out, failed) = filter(&long_cmd, CARGO_CHECK, None);
         assert!(failed && out.len() <= budget::CAP, "len={}", out.len());
     }
 

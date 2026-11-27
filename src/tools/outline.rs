@@ -472,6 +472,7 @@ mod tests {
         assert_eq!(outline("java", java), "L1-5 public class Service {\n  L2-4 public int add(int a, int b) {");
     }
 
+    #[cfg(any(feature = "lang-rust", all(feature = "lang-ts", feature = "lang-python")))]
     fn defs(files: &[(&str, &str)], paths: &[&str]) -> String {
         let dir = tempfile::tempdir().unwrap();
         for (name, src) in files {
