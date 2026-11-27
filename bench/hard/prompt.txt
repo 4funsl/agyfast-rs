@@ -1,0 +1,17 @@
+A client saves whole batch requests and needs to replay selected items by their original positions. Finish the BatchPlan migration and implement the following contract. Preserve the supplied BatchPlan/Slot and fair-join signatures, existing tests and dependency set.
+
+• On requests containing queries, paths, commands, or the mixed outlines/slices/lineRanges arrays, an optional top-level string field pick selects items. The CLI spelling is --pick EXPR. Document it in CLI help and expose pick as an optional string in each applicable published request schema. Preserve the existing list of published operations. A non-null pick on a write request must fail before any file changes.
+
+• Positions are one-based. A comma-separated term is *, N, or an inclusive A-B, optionally prefixed with ! to remove positions. Trim ASCII whitespace around each term only. Numbers are unsigned ASCII decimal, with leading zeroes allowed. Both endpoints must be in the original batch and A <= B. Empty terms, overflow, invalid syntax, and an empty final selection are request errors. Omitted or null pick selects all in input order with legacy output.
+
+• Evaluate left to right, starting empty unless the first term removes positions, in which case start full. Inclusion appends missing positions in ascending order. Removal preserves survivor order. Re-inclusion appends at the end. For five items, "5,2-4,!3,1,3" yields 5,2,4,1,3. Validate the entire expression and original batch-size limits before executing anything.
+
+• Only selected items participate in per-item execution, validation, output ordering and fair byte sharing. Existing request field types still apply. Query headers and generated command names retain original one-based numbers. Indexed command validation errors keep their original zero-based indices. For mixed reads the original position space is outlines first, structured slices next, then lineRanges. Preserve rendering and existing byte floors and caps, including for UTF-8 output.
+
+• For an explicit command selection, the summary counts only selected commands. Append a final line "Replay failed: S" reporting every non-passing original position in numeric order. Collapse each consecutive run to A-B, including pairs, and separate runs with commas. Use "-" for all-pass. The entire footer must survive truncation in either output mode, inside the existing byte limit. Without an explicit selection the legacy report has no footer.
+
+Include passing regression tests named replay_readd_order and replay_failed_ranges for those two behaviors. All supplied regression cases must pass. Acceptance commands from the repository root are
+
+cargo build --offline --locked --all-targets
+cargo clippy --offline --locked --all-targets -- -D warnings
+cargo test --offline --locked --all-targets

@@ -174,6 +174,28 @@ Published because it is part of the measurement:
 - One model family (Gemini 4 Hydrogen); Antigravity CLI 1.5.17–1.5.18.
 - Quality is whatever the scorers check; diffs were not otherwise reviewed.
 
+## Run the benchmarks yourself
+
+Both tasks are in [`bench/`](../bench): `bench/hard` (15 checks) and `bench/long` (36 checks).
+Each has a setup script that builds a fresh fixture repository from a bundled source snapshot, the
+prompt, a scorer with hidden acceptance tests, and a reference solution.
+
+```sh
+dest=$(mktemp -d)
+bench/hard/setup.sh "$dest"                 # fixture at tag `start`, target/ warmed
+cd "$dest" && agy -p "$(cat <repo>/bench/hard/prompt.txt)" --model gemini-4-hydrogen-low \
+    --settings "{\"permissions\":{\"allow\":[\"mcp(*)\",\"write_file($dest)\",\"command(cargo)\",\"command(git)\"]}}" \
+    --output-format stream-json --print-timeout 540s > run.jsonl
+<repo>/bench/hard/verify.sh "$dest"         # prints score=N/15
+python3 <repo>/bench/stats.py run.jsonl     # turns, tokens, cost-weighted, tool calls
+```
+
+For the no-plugin column run `agy plugin disable agyfast-rs` first and enable it again afterwards.
+Setup and scoring work offline once the crates in `Cargo.lock` are in the local cargo cache. The
+fixtures are this project's sources at an earlier revision, so the binary inside them is still
+called `agy-rs`. Details: [`bench/hard/README.md`](../bench/hard/README.md),
+[`bench/long/README.md`](../bench/long/README.md).
+
 ## Measuring your own sessions
 
 Antigravity keeps a transcript per conversation at

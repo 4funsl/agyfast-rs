@@ -1,0 +1,178 @@
+diff --git a/src/tools/report/tap/diagnostic.rs b/src/tools/report/tap/diagnostic.rs
+index 328851e..9f48ef8 100644
+--- a/src/tools/report/tap/diagnostic.rs
++++ b/src/tools/report/tap/diagnostic.rs
+@@ -1,7 +1,13 @@
+ use super::*;
+ impl<'a> Reader<'a> {
+     pub(super) fn diagnostic(&mut self, depth: usize) -> Result<Vec<&'a str>, String> {
+-        let indent = depth * 4 + 2;
++        let Some(open) = self.lines.get(self.pos).and_then(|s| s.strip_suffix("---")) else {
++            return Ok(Vec::new());
++        };
++        let indent = open.len();
++        if !open.bytes().all(|b| b == b' ') || ![depth * 4 + 2, depth * 4 + 4].contains(&indent) {
++            return Ok(Vec::new());
++        }
+         let mut data = Vec::new();
+         let deindent = |line: &'a str| {
+             line.get(..indent)
+@@ -13,6 +19,11 @@ impl<'a> Reader<'a> {
+         }
+         self.pos += 1;
+         while let Some(line) = self.lines.get(self.pos) {
++            if line.is_empty() {
++                self.pos += 1;
++                data.push("");
++                continue;
++            }
+             let body =
+                 deindent(line).ok_or_else(|| error(self.pos + 1, "diagnostic indentation"))?;
+             self.pos += 1;
+diff --git a/src/tools/report/tap/mod.rs b/src/tools/report/tap/mod.rs
+index afedc21..f4369f1 100644
+--- a/src/tools/report/tap/mod.rs
++++ b/src/tools/report/tap/mod.rs
+@@ -35,7 +35,7 @@ impl<'a> Reader<'a> {
+             _ => self.todo += 1,
+         }
+         self.rows.push(json!({
+-            "scope":scope, "number":number, "name":point.name, "status":point.status,
++            "scope":scope.iter().map(|s| point::display_name(s)).collect::<Vec<_>>(), "number":number, "name":point::display_name(point.name), "status":point.status,
+             "reason":point.reason, "diagnostic":diag, "subtest":child,
+         }));
+     }
+@@ -96,6 +96,25 @@ impl<'a> Reader<'a> {
+             if trailing_plan {
+                 return Err(error(n, "point after trailing plan"));
+             }
++            if let Some(head) = line.strip_suffix(" {") {
++                if child.is_some() || depth >= 64 {
++                    return Err(error(n, "unexpected buffered result"));
++                }
++                let item =
++                    point(head, seen + 1).ok_or_else(|| error(n, "invalid buffered parent"))?;
++                scope.push(item.name);
++                self.suite(scope)?;
++                scope.pop();
++                let close = self.lines.get(self.pos).copied().unwrap_or("");
++                if close.strip_suffix('}') != Some(&raw[..indent]) {
++                    return Err(error(self.pos + 1, "unclosed buffered result"));
++                }
++                self.pos += 1;
++                seen += 1;
++                let diag = self.diagnostic(depth)?;
++                self.record(item, scope, seen, diag, true);
++                continue;
++            }
+             let item =
+                 point(line, seen + 1).ok_or_else(|| error(n, "invalid test point or numbering"))?;
+             if child.is_some_and(|name| name != item.name) {
+@@ -112,9 +131,9 @@ impl<'a> Reader<'a> {
+     }
+ }
+ 
+-pub(super) fn parse(src: &str) -> Result<Report, String> {
++fn session(lines: Vec<&str>) -> Result<Report, String> {
+     let mut reader = Reader {
+-        lines: src.lines().collect(),
++        lines,
+         ..Reader::default()
+     };
+     reader.suite(&mut Vec::new())?;
+@@ -124,6 +143,56 @@ pub(super) fn parse(src: &str) -> Result<Report, String> {
+     })
+ }
+ 
++fn tagged(line: &str) -> Option<(&str, &str)> {
++    let (lane, body) = line.strip_prefix('[')?.split_once("] ")?;
++    (!lane.is_empty()).then_some((lane, body))
++}
++
++pub(super) fn parse(src: &str) -> Result<Report, String> {
++    let lines: Vec<_> = src.lines().collect();
++    if !lines.first().is_some_and(|s| tagged(s).is_some()) {
++        return session(lines);
++    }
++    let mut lanes = Vec::new();
++    let mut streams = std::collections::BTreeMap::new();
++    for (i, line) in lines.iter().enumerate() {
++        let (lane, body) = tagged(line).ok_or_else(|| error(i + 1, "missing lane"))?;
++        let stream = streams.entry(lane).or_insert_with(|| {
++            lanes.push(lane);
++            Vec::new()
++        });
++        stream.push((i + 1, body));
++    }
++    let mut result = Report {
++        rows: Vec::new(),
++        summary: json!({"pass":0,"fail":0,"skip":0,"todo":0}),
++    };
++    for lane in lanes {
++        let records = &streams[lane];
++        let report = session(records.iter().map(|(_, s)| *s).collect()).map_err(|message| {
++            // Session diagnostics use one-based positions within this lane.
++            let Some((pos, why)) = message
++                .strip_prefix("tap line ")
++                .and_then(|s| s.split_once(": "))
++            else {
++                return message;
++            };
++            let index = pos.parse::<usize>().expect("session line number");
++            error(records.get(index - 1).map_or(lines.len() + 1, |r| r.0), why)
++        })?;
++        for mut row in report.rows {
++            row["lane"] = json!(lane);
++            result.rows.push(row);
++        }
++        for key in ["pass", "fail", "skip", "todo"] {
++            result.summary[key] = json!(
++                result.summary[key].as_u64().unwrap() + report.summary[key].as_u64().unwrap()
++            );
++        }
++    }
++    Ok(result)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -143,4 +212,17 @@ mod tests {
+         let report = parse("not ok - issue\n  ---\n  1..900\n  ...\n1..1").unwrap();
+         assert_eq!(report.rows[0]["diagnostic"], json!(["1..900"]));
+     }
++
++    #[test]
++    fn tap_archive_regression() {
++        let r = parse("[b] ok hot\n[a] 1..0\n[b] 1..1").unwrap();
++        assert_eq!(r.rows.len(), 1);
++        assert_eq!(r.rows[0]["lane"], "b");
++    }
++    #[test]
++    fn tap_boundary_regression() {
++        let r = parse("ok skip {\n    1..0\n}\n1..1").unwrap();
++        assert_eq!(r.rows[0]["subtest"], true);
++        assert!(parse("ok skip {\n    1..0").is_err());
++    }
+ }
+diff --git a/src/tools/report/tap/point.rs b/src/tools/report/tap/point.rs
+index 3591fb7..34a3361 100644
+--- a/src/tools/report/tap/point.rs
++++ b/src/tools/report/tap/point.rs
+@@ -58,3 +58,16 @@ pub(super) fn point(line: &str, next: usize) -> Option<Point<'_>> {
+         name,
+     })
+ }
++
++pub(super) fn display_name(label: &str) -> String {
++    let mut text = String::new();
++    let mut chars = label.chars().peekable();
++    while let Some(ch) = chars.next() {
++        if ch == '\\' && chars.peek().is_some_and(|next| matches!(next, '#' | '\\')) {
++            text.push(chars.next().unwrap());
++        } else {
++            text.push(ch);
++        }
++    }
++    text
++}

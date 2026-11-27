@@ -1,0 +1,150 @@
+diff --git a/src/tools/report/diff/header.rs b/src/tools/report/diff/header.rs
+index 78cb6ab..217349c 100644
+--- a/src/tools/report/diff/header.rs
++++ b/src/tools/report/diff/header.rs
+@@ -32,3 +32,15 @@ pub(super) fn header(raw: &str) -> Option<(Range, Range, &str)> {
+     };
+     Some((range(left, '-')?, range(right, '+')?, heading))
+ }
++
++impl Range {
++    // Convert the unified range to zero-based boundary coordinates.
++    pub(super) fn boundaries(self) -> (u64, u64) {
++        let begin = if self.count == 0 {
++            self.start
++        } else {
++            self.start - 1
++        };
++        (begin, begin + self.count)
++    }
++}
+diff --git a/src/tools/report/diff/mod.rs b/src/tools/report/diff/mod.rs
+index 1dd8c46..eaf5045 100644
+--- a/src/tools/report/diff/mod.rs
++++ b/src/tools/report/diff/mod.rs
+@@ -26,26 +26,66 @@ struct Hunk<'a> {
+     heading: &'a str,
+ }
+ 
++fn envelope(line: &str) -> bool {
++    line.strip_prefix("From ")
++        .and_then(|s| s.strip_suffix(" Mon Sep 17 00:00:00 2001"))
++        .is_some_and(|hash| hash.len() == 40 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
++}
++
+ pub(super) fn parse(src: &str) -> Result<Report, String> {
+-    // A mailed patch begins with an envelope and a human-readable cover letter.
+-    let mut lines: Vec<_> = src.lines().collect();
+-    if lines.first().is_some_and(|line| line.starts_with("From "))
+-        && let Some(start) = lines
+-            .iter()
+-            .position(|line| line.starts_with("diff --git "))
+-    {
+-        lines.drain(..start);
+-    }
++    let lines: Vec<_> = src.lines().collect();
+     let mut pos = 0;
+     let mut totals = Totals::default();
+     let mut rows = Vec::new();
++    let mut mail = false;
+     while pos < lines.len() {
+         let line = lines[pos];
++        if envelope(line) {
++            mail = true;
++            pos += 1;
++            while pos < lines.len()
++                && !lines[pos].starts_with("diff --git ")
++                && !envelope(lines[pos])
++            {
++                pos += 1;
++            }
++            continue;
++        }
++        if mail && line == "-- " {
++            pos += 1;
++            while pos < lines.len() && !envelope(lines[pos]) {
++                pos += 1;
++            }
++            continue;
++        }
++        if let Some((kind, from)) = line
++            .strip_prefix("rename from ")
++            .map(|v| ("rename", v))
++            .or_else(|| line.strip_prefix("copy from ").map(|v| ("copy", v)))
++        {
++            let old = path(from, "", pos + 1)?;
++            pos += 1;
++            let to = lines
++                .get(pos)
++                .and_then(|s| s.strip_prefix(kind))
++                .and_then(|s| s.strip_prefix(" to "))
++                .ok_or_else(|| error(pos + 1, "missing destination"))?;
++            let new = path(to, "", pos + 1)?;
++            rows.push(json!({"kind":kind,"old":old,"new":new}));
++            pos += 1;
++            // An edited transfer has normal content headers after optional index metadata.
++            let next = lines[pos..].iter().find(|s| !s.starts_with("index "));
++            if !next.is_some_and(|s| s.starts_with("--- ")) {
++                totals.files += 1;
++            }
++            continue;
++        }
+         if line.is_empty()
+             || [
+                 "diff --git ",
+                 "index ",
+                 "new file mode ",
++                "similarity index ",
+                 "deleted file mode ",
+             ]
+             .iter()
+@@ -72,10 +112,17 @@ pub(super) fn parse(src: &str) -> Result<Report, String> {
+         pos += 1;
+         totals.files += 1;
+         let mut id = 0;
++        let mut limit = (0, 0);
+         while let Some(line) = lines.get(pos).filter(|s| s.starts_with("@@")) {
+             let (left, right, heading) =
+                 header(line).ok_or_else(|| error(pos + 1, "invalid hunk header"))?;
+             pos += 1;
++            let (old_begin, old_end) = left.boundaries();
++            let (new_begin, new_end) = right.boundaries();
++            if old_begin < limit.0 || new_begin < limit.1 {
++                return Err(error(pos, "hunks overlap or regress"));
++            }
++            limit = (old_end, new_end);
+             id += 1;
+             totals.hunks += 1;
+             body(
+@@ -122,4 +169,18 @@ mod tests {
+         );
+         assert!(path(r#""a/\377""#, "a/", 1).is_err());
+     }
++
++    #[test]
++    fn diff_archive_regression() {
++        let out =
++            parse("diff --git a/a b/b\nsimilarity index 100%\ncopy from a\ncopy to λ").unwrap();
++        assert_eq!(out.rows[0]["new"], "λ");
++        assert_eq!(out.summary["files"], 1);
++    }
++    #[test]
++    fn diff_boundary_regression() {
++        let input = "--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n+first\n@@ -1 +2 @@\n old";
++        assert!(parse(input).is_ok());
++        assert!(parse(&input.replace("-1 +2", "-1 +1")).is_err());
++    }
+ }
+diff --git a/src/tools/report/diff/regions.rs b/src/tools/report/diff/regions.rs
+index 8bc8a30..f4bc02b 100644
+--- a/src/tools/report/diff/regions.rs
++++ b/src/tools/report/diff/regions.rs
+@@ -45,7 +45,7 @@ pub(super) fn body(
+             break;
+         }
+         let n = *pos + 1;
+-        let op = line.and_then(|s| s.as_bytes().first()).copied();
++        let op = line.map(|s| s.as_bytes().first().copied().unwrap_or(b' '));
+         if edit.added == 0 && edit.removed == 0 {
+             edit.old_at = old.start + left;
+             edit.new_at = new.start + right;

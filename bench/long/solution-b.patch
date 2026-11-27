@@ -1,0 +1,235 @@
+diff --git a/src/tools/report/lcov/mod.rs b/src/tools/report/lcov/mod.rs
+index ab6c5c2..717445f 100644
+--- a/src/tools/report/lcov/mod.rs
++++ b/src/tools/report/lcov/mod.rs
+@@ -27,6 +27,7 @@ struct Reader {
+     files: BTreeMap<String, Source>,
+     current: Option<String>,
+     records: usize,
++    groups: BTreeMap<u64, (u64, Option<u64>)>,
+ }
+ 
+ impl Reader {
+@@ -36,6 +37,7 @@ impl Reader {
+         }
+         if line == "end_of_record" {
+             self.current.take().ok_or("unmatched end_of_record")?;
++            self.groups.clear();
+             self.records += 1;
+             return Ok(());
+         }
+@@ -52,6 +54,31 @@ impl Reader {
+         let path = self.current.as_ref().ok_or("field outside source record")?;
+         let source = self.files.get_mut(path).expect("registered on SF");
+         match tag {
++            "FNL" => {
++                let (id, range) = raw.split_once(',').ok_or("missing location")?;
++                let (begin, end) = range
++                    .split_once(',')
++                    .map_or((range, None), |(a, b)| (a, Some(b)));
++                let begin = coordinate(begin)?;
++                let end = end.map(coordinate).transpose()?;
++                if end.is_some_and(|n| n < begin) {
++                    return Err("invalid extent");
++                }
++                let id = integer(id)?;
++                if self.groups.insert(id, (begin, end)).is_some() {
++                    return Err("duplicate function group");
++                }
++                Ok(())
++            }
++            "FNA" => {
++                let mut fields = raw.splitn(3, ',');
++                let id = integer(fields.next().unwrap_or(""))?;
++                let count = fields.next().ok_or("missing count")?;
++                let name = fields.next().ok_or("missing name")?;
++                let &(begin, end) = self.groups.get(&id).ok_or("unknown function group")?;
++                source.declare(name, begin, end)?;
++                source.observe(name, integer(count)?)
++            }
+             "DA" => source.add_line(raw),
+             "FN" | "FNDA" => source.function(raw, tag == "FN"),
+             "BRDA" => source.branch(raw),
+@@ -61,11 +88,39 @@ impl Reader {
+     }
+ }
+ 
++fn superseded(lines: &[&str]) -> Vec<bool> {
++    let mut omitted = vec![false; lines.len()];
++    let mut snapshots = BTreeMap::new();
++    let mut test = "";
++    let mut pending = None;
++    for (i, &line) in lines.iter().enumerate() {
++        if let Some(name) = line.strip_prefix("TN:") {
++            test = name;
++        }
++        if let Some(path) = line.strip_prefix("SF:") {
++            pending = filename(path).ok().map(|path| (i, (test, path)));
++        }
++        if line == "end_of_record"
++            && let Some((begin, key)) = pending.take()
++            && !key.0.is_empty()
++            && let Some(old) = snapshots.insert(key, begin..=i)
++        {
++            omitted[old].fill(true);
++        }
++    }
++    omitted
++}
++
+ pub(super) fn parse(src: &str) -> Result<Report, String> {
+     let mut reader = Reader::default();
+     let mut last = 0;
+-    for (index, line) in src.lines().enumerate() {
++    let lines: Vec<_> = src.lines().collect();
++    let omitted = superseded(&lines);
++    for (index, line) in lines.iter().enumerate() {
+         last = index + 1;
++        if omitted[index] {
++            continue;
++        }
+         reader
+             .line(line)
+             .map_err(|e| format!("lcov line {last}: {e}"))?;
+@@ -103,4 +158,18 @@ mod tests {
+         assert_eq!(report.rows[0]["taken"], 0);
+         assert_eq!(report.rows[0]["branches"], 1);
+     }
++
++    #[test]
++    fn lcov_archive_regression() {
++        let report =
++            parse("TN:x\nSF:f\nFN:1,old\nend_of_record\nSF:f\nDA:1,2\nend_of_record").unwrap();
++        assert_eq!(report.rows[0]["functions"], 0);
++        assert_eq!(report.summary["records"], 1);
++    }
++    #[test]
++    fn lcov_boundary_regression() {
++        let input = "SF:f\nFN:3,3,identity\nFNDA:1,identity\nend_of_record";
++        assert_eq!(parse(input).unwrap().rows[0]["functions"], 1);
++        assert!(parse(&input.replace("3,3", "3,2")).is_err());
++    }
+ }
+diff --git a/src/tools/report/lcov/paths.rs b/src/tools/report/lcov/paths.rs
+index 3e52ba3..ee4d15a 100644
+--- a/src/tools/report/lcov/paths.rs
++++ b/src/tools/report/lcov/paths.rs
+@@ -1,11 +1,35 @@
+ use super::Parsed;
+ pub(super) fn filename(raw: &str) -> Parsed<String> {
+-    // Coverage exporters on Windows may use either separator.
+-    let slashes = raw.replace('\\', "/");
+-    let raw = slashes.as_str();
+-    let absolute = raw.starts_with('/');
++    let windows = raw.as_bytes().get(1) == Some(&b':')
++        && raw.as_bytes()[0].is_ascii_alphabetic()
++        && raw
++            .as_bytes()
++            .get(2)
++            .is_some_and(|c| matches!(c, b'/' | b'\\'));
++    let unc = raw.starts_with("\\\\") || raw.starts_with("//");
++    let canonical = if windows || unc {
++        raw.replace('\\', "/")
++    } else {
++        raw.to_string()
++    };
++    let mut prefix = String::new();
++    let mut body = canonical.as_str();
++    if windows {
++        prefix = canonical[..2].to_ascii_uppercase();
++        body = &canonical[2..];
++    } else if unc {
++        let mut parts = canonical.trim_start_matches('/').splitn(3, '/');
++        let server = parts.next().unwrap_or("");
++        let share = parts
++            .next()
++            .filter(|s| !s.is_empty())
++            .ok_or("invalid UNC root")?;
++        prefix = format!("//{server}/{share}");
++        body = parts.next().unwrap_or("");
++    }
++    let absolute = windows || unc || raw.starts_with('/');
+     let mut parts = Vec::new();
+-    for component in raw.split('/') {
++    for component in body.split('/') {
+         match component {
+             "" | "." => {}
+             ".." if parts.last().is_some_and(|p| *p != "..") => {
+@@ -19,7 +43,7 @@ pub(super) fn filename(raw: &str) -> Parsed<String> {
+         return Err("empty source path");
+     }
+     Ok(format!(
+-        "{}{}",
++        "{prefix}{}{}",
+         if absolute { "/" } else { "" },
+         parts.join("/")
+     ))
+diff --git a/src/tools/report/lcov/source.rs b/src/tools/report/lcov/source.rs
+index 277e5b0..12c4c87 100644
+--- a/src/tools/report/lcov/source.rs
++++ b/src/tools/report/lcov/source.rs
+@@ -8,6 +8,7 @@ struct Line {
+ #[derive(Default)]
+ struct Function {
+     declaration: Option<u64>,
++    end: Option<u64>,
+     hits: u64,
+ }
+ 
+@@ -43,16 +44,49 @@ impl Source {
+         if name.is_empty() {
+             return Err("empty function name");
+         }
+-        let function = self.functions.entry(name.to_owned()).or_default();
+-        if declaration {
+-            let line = coordinate(value)?;
+-            if function.declaration.is_some_and(|old| old != line) {
+-                return Err("conflicting function declaration");
++        let (end, name) = if declaration {
++            if let Some((field, tail)) = name.split_once(',')
++                && !field.is_empty()
++                && field.bytes().all(|b| b.is_ascii_digit())
++            {
++                (Some(coordinate(field)?), tail)
++            } else {
++                (None, name)
+             }
+-            function.declaration = Some(line);
+         } else {
+-            function.hits = function.hits.saturating_add(integer(value)?);
++            (None, name)
++        };
++        if declaration {
++            self.declare(name, coordinate(value)?, end)
++        } else {
++            self.observe(name, integer(value)?)
++        }
++    }
++
++    pub(super) fn declare(&mut self, name: &str, line: u64, end: Option<u64>) -> Parsed<()> {
++        if name.is_empty() {
++            return Err("empty function name");
+         }
++        let function = self.functions.entry(name.to_owned()).or_default();
++        if function.declaration.is_some_and(|old| old != line) {
++            return Err("conflicting function declaration");
++        }
++        if let Some(end) = end {
++            if end < line || function.end.is_some_and(|old| old != end) {
++                return Err("conflicting function extent");
++            }
++            function.end = Some(end);
++        }
++        function.declaration = Some(line);
++        Ok(())
++    }
++
++    pub(super) fn observe(&mut self, name: &str, hits: u64) -> Parsed<()> {
++        if name.is_empty() {
++            return Err("empty function name");
++        }
++        let function = self.functions.entry(name.to_owned()).or_default();
++        function.hits = function.hits.saturating_add(hits);
+         Ok(())
+     }
+ 

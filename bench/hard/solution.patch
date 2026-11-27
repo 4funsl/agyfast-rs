@@ -1,0 +1,391 @@
+diff --git a/src/cli.rs b/src/cli.rs
+index 05932e8..a3de042 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -18,6 +18,7 @@ const HELP: &str = r#"agy-rs cli <tool> [--cwd DIR] [--max-chars N] [--json '{..
+                    exit 1 when the output shows failure (used by `agy-rs hook pre-bash`)
+   snapshot
+   worker-brief   print the /swarm worker brief with this binary's path filled in; set --cwd <WORKSPACE> before pasting
++--pick EXPR selects original batch items, e.g. 3,1-2,!1 (search, outline, slices, check).
+ --json / --stdin take the tool's full MCP argument object; flags given after them override it."#;
+ 
+ /// The `/swarm` worker brief; `<AGY>` becomes the running binary's quoted path.
+@@ -59,6 +60,7 @@ fn build(tool: &str, args: &[String]) -> Result<Value, String> {
+                 std::io::stdin().read_to_string(&mut text).map_err(|e| format!("Error: reading stdin: {e}"))?;
+                 top.extend(object(&text)?);
+             }
++            "--pick" => drop(top.insert("pick".into(), value()?.into())),
+             "--cwd" => drop(top.insert("cwd".into(), value()?.into())),
+             "--max-chars" => drop(top.insert("maxChars".into(), number(value()?)?.into())),
+             "--concurrency" => drop(top.insert("concurrency".into(), number(value()?)?.into())),
+diff --git a/src/core/batch.rs b/src/core/batch.rs
+index 2a3a8e1..2a4598e 100644
+--- a/src/core/batch.rs
++++ b/src/core/batch.rs
+@@ -22,12 +22,69 @@ pub struct BatchPlan {
+ impl BatchPlan {
+     /// Resolve the requested slots before doing any per-item work.
+     pub fn new(count: usize, pick: Option<&str>, max_chars: Option<usize>, floor: usize) -> Result<Self, String> {
+-        if pick.is_some() {
+-            return Err("Error: pick is not implemented".into());
++        let slots = match pick {
++            None => (0..count).map(Slot).collect(),
++            Some(expr) => select(count, expr)?,
++        };
++        Ok(Self { slots, bytes: budget::limit(max_chars, floor) })
++    }
++}
++
++fn endpoint(s: &str, count: usize) -> Option<usize> {
++    if !s.bytes().all(|b| b.is_ascii_digit()) {
++        return None;
++    }
++    s.parse::<usize>().ok().filter(|n| (1..=count).contains(n))
++}
++
++fn select(count: usize, expr: &str) -> Result<Vec<Slot>, String> {
++    let all = expr.trim_ascii_start().starts_with('!');
++    let mut slots: Vec<Slot> = if all { (0..count).map(Slot).collect() } else { Vec::new() };
++    let mut present = vec![all; count];
++    for raw in expr.split(',') {
++        let term = raw.trim_ascii();
++        let (remove, atom) = term.strip_prefix('!').map_or((false, term), |s| (true, s));
++        let range = if atom == "*" {
++            0..count
++        } else {
++            let (lo, hi) = atom.split_once('-').unwrap_or((atom, atom));
++            let invalid = || format!("Error: invalid pick term {term:?}");
++            let lo = endpoint(lo, count).ok_or_else(invalid)?;
++            let hi = endpoint(hi, count).filter(|&n| n >= lo).ok_or_else(invalid)?;
++            lo - 1..hi
++        };
++        if remove {
++            slots.retain(|s| !range.contains(&s.index()));
++            present[range].fill(false);
++        } else {
++            for i in range {
++                if !present[i] {
++                    present[i] = true;
++                    slots.push(Slot(i));
++                }
++            }
++        }
++    }
++    if slots.is_empty() {
++        return Err("Error: invalid pick: no items selected".into());
++    }
++    Ok(slots)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn replay_readd_order() {
++        let slots = select(5, " !2-4 ,03,2,* ").unwrap();
++        assert_eq!(slots.iter().map(|s| s.number()).collect::<Vec<_>>(), [1, 5, 3, 2, 4]);
++    }
++
++    #[test]
++    fn rejects_malformed_and_empty_selections() {
++        for expr in ["!*", "1,,2", "+1", "2-1", "184467440737095516160", "3", "1 2"] {
++            assert!(select(2, expr).is_err(), "{expr}");
+         }
+-        Ok(Self {
+-            slots: (0..count).map(Slot).collect(),
+-            bytes: budget::limit(max_chars, floor),
+-        })
+     }
+ }
+diff --git a/src/core/budget.rs b/src/core/budget.rs
+index ffc38c7..e5a496b 100644
+--- a/src/core/budget.rs
++++ b/src/core/budget.rs
+@@ -63,7 +63,10 @@ pub fn join_fair(parts: &[String], plan: &BatchPlan) -> String {
+ 
+ /// `join_fair` over `fair_by` parts.
+ pub fn join_fair_by(lens: &[usize], plan: &BatchPlan, fit: impl FnMut(usize, usize) -> String) -> String {
+-    let seps = 2 * lens.len().saturating_sub(1);
++    let seps = lens.len().saturating_sub(1).saturating_mul(2);
++    if seps >= plan.bytes {
++        return fold(&format!("[truncated: {} sections exceed byte budget]", lens.len()), plan.bytes);
++    }
+     fair_by(lens, plan.bytes.saturating_sub(seps), fit).join("\n\n")
+ }
+ 
+diff --git a/src/mcp/schema.rs b/src/mcp/schema.rs
+index f68dcd8..20b0447 100644
+--- a/src/mcp/schema.rs
++++ b/src/mcp/schema.rs
+@@ -13,6 +13,7 @@ fn tool(name: &str, description: &str, required: &[&str], mut properties: Value)
+ }
+ 
+ pub fn tools() -> Value {
++    let pick = json!({"type": "string", "description": "Replay original positions in expression order, e.g. 3,1-2,!1."});
+     let max_chars = json!({"type": "integer", "description": "Output byte cap, max 8800."});
+     json!([
+         tool(
+@@ -35,6 +36,7 @@ pub fn tools() -> Value {
+                         "maxResults": {"type": "integer", "minimum": 1, "maximum": 200}
+                     }
+                 }},
++                "pick": pick,
+                 "maxChars": max_chars
+             }),
+         ),
+@@ -44,6 +46,7 @@ pub fn tools() -> Value {
+             &["paths"],
+             json!({
+                 "paths": {"type": "array", "minItems": 1, "maxItems": 40, "items": {"type": "string"}},
++                "pick": pick,
+                 "maxChars": max_chars
+             }),
+         ),
+@@ -89,6 +92,7 @@ pub fn tools() -> Value {
+                 "concurrency": {"type": "integer", "minimum": 1, "maximum": 8},
+                 "timeoutSec": {"type": "integer"},
+                 "outputMode": {"type": "string", "enum": ["compact", "full"], "description": "full: show passing output too."},
++                "pick": pick,
+                 "maxChars": max_chars
+             }),
+         ),
+diff --git a/src/tools/check.rs b/src/tools/check.rs
+index ff811ec..8a3e94b 100644
+--- a/src/tools/check.rs
++++ b/src/tools/check.rs
+@@ -3,7 +3,7 @@
+ //! runners, TS linters, generic head-tail). Plain `a && b` chains run step by
+ //! step so each step gets its own compressor.
+ 
+-use crate::core::{budget, cwd};
++use crate::core::{batch::BatchPlan, budget, cwd};
+ use rayon::prelude::*;
+ use serde::Deserialize;
+ use serde_json::Value;
+@@ -29,6 +29,7 @@ struct Args {
+     timeout_sec: Option<u64>,
+     output_mode: Option<String>,
+     max_chars: Option<usize>,
++    pick: Option<String>,
+ }
+ 
+ #[derive(Deserialize)]
+@@ -77,11 +78,12 @@ pub fn run(args: Value) -> Result<String, String> {
+         Some(o) => return Err(format!("Error: outputMode must be \"compact\" or \"full\", got `{o}`")),
+     };
+     let base = cwd::resolve(a.cwd.as_deref())?;
+-    let jobs = a
+-        .commands
++    let mut plan = BatchPlan::new(a.commands.len(), a.pick.as_deref(), a.max_chars, 500)?;
++    let jobs = plan.slots
+         .iter()
+-        .enumerate()
+-        .map(|(i, c)| {
++        .map(|slot| {
++            let i = slot.index();
++            let c = &a.commands[i];
+             let command = c.command.trim();
+             if command.is_empty() {
+                 return Err(format!("Error: commands[{i}].command is empty"));
+@@ -96,7 +98,7 @@ pub fn run(args: Value) -> Result<String, String> {
+             let name = match c.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                 Some(n) => n.to_string(),
+                 None if command.len() <= 80 && !command.contains('\n') => command.to_string(),
+-                None => format!("check-{}", i + 1),
++                None => format!("check-{}", slot.number()),
+             };
+             let timeout = c.timeout_sec.or(a.timeout_sec).unwrap_or(DEFAULT_TIMEOUT).clamp(1, MAX_TIMEOUT);
+             Ok((name, command, dir, timeout))
+@@ -135,7 +137,33 @@ pub fn run(args: Value) -> Result<String, String> {
+         }
+     };
+     let lens: Vec<usize> = (0..=runs.len()).map(|i| part(i, usize::MAX).len()).collect();
+-    Ok(budget::join_fair_by(&lens, budget::limit(a.max_chars, 500), |i, share| budget::fold(&part(i, share), share)))
++    let mut footer = String::new();
++    if a.pick.is_some() {
++        let failed = plan.slots.iter().zip(&runs)
++            .filter(|(_, r)| r.status != Status::Pass)
++            .map(|(slot, _)| slot.number()).collect();
++        footer = format!("\nReplay failed: {}", replay_ranges(failed));
++        plan.bytes -= footer.len(); // at most 12 command numbers; floor is 500 bytes
++    }
++    let report = budget::join_fair_by(&lens, &plan, |i, share| budget::fold(&part(i, share), share));
++    Ok(report + &footer)
++}
++
++fn replay_ranges(mut numbers: Vec<usize>) -> String {
++    if numbers.is_empty() {
++        return "-".into();
++    }
++    numbers.sort_unstable();
++    let mut ranges = Vec::new();
++    let mut it = numbers.into_iter().peekable();
++    while let Some(first) = it.next() {
++        let mut last = first;
++        while it.next_if_eq(&(last + 1)).is_some() {
++            last += 1;
++        }
++        ranges.push(if first == last { first.to_string() } else { format!("{first}-{last}") });
++    }
++    ranges.join(",")
+ }
+ 
+ /// Run one verify command for `apply_edits` and return its compressed report,
+@@ -964,6 +992,12 @@ error: test failed, to rerun pass `--bin demo`"##;
+         tempfile::tempdir().unwrap()
+     }
+ 
++    #[test]
++    fn replay_failed_ranges() {
++        assert_eq!(replay_ranges(vec![7, 2, 3, 6, 1, 9]), "1-3,6-7,9");
++        assert_eq!(replay_ranges(Vec::new()), "-");
++    }
++
+     #[test]
+     fn injects_message_format_only_into_plain_cargo_invocations() {
+         let j = |c: &str| inject_json(c);
+diff --git a/src/tools/edit.rs b/src/tools/edit.rs
+index b5da697..1b49429 100644
+--- a/src/tools/edit.rs
++++ b/src/tools/edit.rs
+@@ -289,6 +289,9 @@ fn bullets(header: &str, items: &[String], max: usize) -> String {
+ }
+ 
+ pub fn run(args: Value) -> Result<String, String> {
++    if !args["pick"].is_null() {
++        return Err("Error: pick is unsupported for edits (0 files modified)".into());
++    }
+     let a: Args = serde_json::from_value(args).map_err(|e| format!("Error: invalid apply_edits arguments (0 files modified): {e}"))?;
+     if !(1..=50).contains(&a.edits.len()) {
+         return Err(format!("Error: `edits` must list 1-50 files, got {} (0 files modified)", a.edits.len()));
+diff --git a/src/tools/outline.rs b/src/tools/outline.rs
+index ea54050..a8ca2bd 100644
+--- a/src/tools/outline.rs
++++ b/src/tools/outline.rs
+@@ -1,7 +1,7 @@
+ //! quick_outline: one tree-sitter query engine for every language, plus a line
+ //! scanner for Markdown, unsupported extensions and parse/query failures.
+ 
+-use crate::core::{budget, cwd};
++use crate::core::{batch::BatchPlan, budget, cwd};
+ use rayon::prelude::*;
+ use serde::Deserialize;
+ use serde_json::Value;
+@@ -18,6 +18,7 @@ struct Args {
+     #[serde(default)]
+     paths: Vec<String>,
+     max_chars: Option<usize>,
++    pick: Option<String>,
+ }
+ 
+ pub fn run(args: Value) -> Result<String, String> {
+@@ -26,8 +27,12 @@ pub fn run(args: Value) -> Result<String, String> {
+         return Err(format!("Error: `paths` needs 1..40 entries, got {}", args.paths.len()));
+     }
+     let dir = cwd::resolve(args.cwd.as_deref())?;
+-    let parts: Vec<String> = args.paths.par_iter().map(|p| outline_file(&dir.join(p), p)).collect();
+-    Ok(budget::join_fair(&parts, budget::limit(args.max_chars, 1000)))
++    let plan = BatchPlan::new(args.paths.len(), args.pick.as_deref(), args.max_chars, 1000)?;
++    let parts: Vec<String> = plan.slots.par_iter().map(|slot| {
++        let p = &args.paths[slot.index()];
++        outline_file(&dir.join(p), p)
++    }).collect();
++    Ok(budget::join_fair(&parts, &plan))
+ }
+ 
+ /// File text for outlining or slicing; `Err` is a one-line reason to show inline.
+diff --git a/src/tools/search.rs b/src/tools/search.rs
+index 099d058..bb86ee4 100644
+--- a/src/tools/search.rs
++++ b/src/tools/search.rs
+@@ -1,7 +1,7 @@
+ //! batch_search: 1-20 text/regex/glob/fuzzy/read-only-git queries run
+ //! concurrently; each result is printed under its own header.
+ 
+-use crate::core::{budget, cwd};
++use crate::core::{batch::BatchPlan, budget, cwd};
+ use crate::tools::outline;
+ use globset::{GlobBuilder, GlobMatcher};
+ use grep_matcher::Matcher;
+@@ -25,6 +25,7 @@ struct Args {
+     cwd: Option<String>,
+     queries: Vec<Query>,
+     max_chars: Option<usize>,
++    pick: Option<String>,
+ }
+ 
+ #[derive(Deserialize)]
+@@ -59,14 +60,14 @@ pub fn run(args: Value) -> Result<String, String> {
+         return Err(format!("Error: batch_search takes 1-20 queries, got {}", args.queries.len()));
+     }
+     let base = cwd::resolve(args.cwd.as_deref())?;
+-    let parts: Vec<(String, Body)> = args
+-        .queries
++    let plan = BatchPlan::new(args.queries.len(), args.pick.as_deref(), args.max_chars, 500)?;
++    let parts: Vec<(String, Body)> = plan.slots
+         .par_iter()
+-        .enumerate()
+-        .map(|(i, q)| {
++        .map(|slot| {
++            let q = &args.queries[slot.index()];
+             let header = format!(
+                 "## Query {} [{}] {}{}",
+-                i + 1,
++                slot.number(),
+                 q.kind,
+                 q.pattern,
+                 q.path.as_deref().map(|p| format!(" (in {p})")).unwrap_or_default()
+@@ -75,7 +76,7 @@ pub fn run(args: Value) -> Result<String, String> {
+         })
+         .collect();
+     let lens: Vec<usize> = parts.iter().map(|(h, b)| h.len() + 1 + b.full_len()).collect();
+-    Ok(budget::join_fair_by(&lens, budget::limit(args.max_chars, 500), |i, share| {
++    Ok(budget::join_fair_by(&lens, &plan, |i, share| {
+         let (h, b) = &parts[i];
+         budget::fold(&format!("{h}\n{}", b.fit(share.saturating_sub(h.len() + 1))), share)
+     }))
+@@ -394,7 +395,7 @@ impl Hits {
+                 let next = used + block.len() + 1 - if blocks[i].is_empty() { 0 } else { blocks[i].len() + 1 };
+                 if next + self.notice(&shown, room / 4).len() > room {
+                     shown[i] -= 1;
+-                    break 'fill;
++                    continue;
+                 }
+                 (used, blocks[i], total) = (next, block, total + 1);
+             }
+diff --git a/src/tools/slices.rs b/src/tools/slices.rs
+index c308b96..3bfaeef 100644
+--- a/src/tools/slices.rs
++++ b/src/tools/slices.rs
+@@ -1,6 +1,6 @@
+ //! read_slices: outlines plus exact 1-based inclusive line ranges in one call.
+ 
+-use crate::core::{budget, cwd};
++use crate::core::{batch::BatchPlan, budget, cwd};
+ use crate::tools::outline::{outline_file, read_text};
+ use rayon::prelude::*;
+ use serde::Deserialize;
+@@ -18,6 +18,7 @@ struct Args {
+     #[serde(default)]
+     line_ranges: Vec<String>,
+     max_chars: Option<usize>,
++    pick: Option<String>,
+ }
+ 
+ #[derive(Deserialize)]
+@@ -51,11 +52,12 @@ pub fn run(args: Value) -> Result<String, String> {
+         }))
+         .chain(args.line_ranges.iter().map(|s| parse_line_ranges(s)))
+         .collect();
+-    let parts: Vec<String> = jobs.par_iter().map(|job| match job {
++    let plan = BatchPlan::new(jobs.len(), args.pick.as_deref(), args.max_chars, 1000)?;
++    let parts: Vec<String> = plan.slots.par_iter().map(|slot| match &jobs[slot.index()] {
+         Job::Outline(p) => outline_file(&dir.join(p), p),
+         Job::Slice(p, ranges) => slice_file(&dir.join(p), p, ranges),
+     }).collect();
+-    Ok(budget::join_fair(&parts, budget::limit(args.max_chars, 1000)))
++    Ok(budget::join_fair(&parts, &plan))
+ }
+ 
+ /// `"path:start-end,start2-end2"`; a bare `N` means line N. The last `:` splits, so Windows drives work.

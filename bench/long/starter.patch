@@ -1,0 +1,1733 @@
+diff --git a/fixtures/reports/README.md b/fixtures/reports/README.md
+new file mode 100644
+index 0000000..b380aa7
+--- /dev/null
++++ b/fixtures/reports/README.md
+@@ -0,0 +1,11 @@
++# Report importer incident archive
++
++The raw attachments under each format come from client workflows. Each .checks.json is a capture of fields consumed by the UI, or the physical source line shown by the error inspector. Keys beginning with / are JSON Pointers. Other output fields still follow the existing importer. Archive tests read the actual files through the public entry point. Keep the old unit tests, inputs, and captured expectations intact.
++
++The patch viewer lists path transfers even without a text change. In a transfer with edits it displays the transfer first and counts the file once. Both coordinates in subsequent hunks must move forward or touch the previous boundary. Git's zero-length range refers to the boundary after its start line. The viewer accepts Git's suppressed empty context and concatenated format-patch mail. Attachments show which parts of mail are visible and where errors are reported.
++
++The coverage dashboard combines independent producers. Named TN jobs publish complete snapshots per normalized source: a retry supersedes that job's previous source record, including observations now absent. Other jobs and anonymous sections contribute independently. The record count covers contributing sections. Windows drive letters use upper case; drive and UNC roots survive parent traversal. Elsewhere filenames retain case. Compiler exporters include optional function end lines in FN, and grouped FNL/FNA records. The sample exports illustrate the identity and lifetime of each kind of function observation.
++
++The test inspector also imports multiplexed runs. A tagged run uses "[lane] " before every physical line. The inspector enumerates lanes by first appearance, then each lane's normal result order. It shows the lane on each tagged row and uses physical input positions in errors (global EOF for a lane ending early). Parent names and scope components have the same display escaping as leaf labels. Buffered and streamed subtests use suite-local numbering and emit children before the closing result. Diagnostic attachments are opaque.
++
++Add two new passing tests in each repaired subsystem. The release gate recognizes diff_archive_regression and diff_boundary_regression, lcov_archive_regression and lcov_boundary_regression, tap_archive_regression and tap_boundary_regression. Use a new example to demonstrate an archive incident and a neighboring boundary condition for each pair.
+diff --git a/fixtures/reports/clients.md b/fixtures/reports/clients.md
+new file mode 100644
+index 0000000..145bed7
+--- /dev/null
++++ b/fixtures/reports/clients.md
+@@ -0,0 +1,8 @@
++# Release client transcript
++
++Interactive usage lists inspect, --format, --report and all three format choices in cli --help. The desktop client invokes:
++
++    agy-rs cli inspect --format tap --report "unit report.tap"
++    agy-rs cli inspect --json '{"format":"tap","path":"unit report.tap"}'
++
++For any format and path these spellings have the same stdout and exit status, including on errors. Generic --cwd and --max-chars remain available. The inventory client expects the historical public operations in order followed by inspect_report. For inspect_report its required string properties are path and format (the enum diff, lcov, tap). The optional properties are cwd (string) and maxChars (integer). Update both existing registry tests with this release.
+diff --git a/fixtures/reports/diff/adjacent.checks.json b/fixtures/reports/diff/adjacent.checks.json
+new file mode 100644
+index 0000000..45e2624
+--- /dev/null
++++ b/fixtures/reports/diff/adjacent.checks.json
+@@ -0,0 +1,3 @@
++{
++  "/summary/hunks": 2
++}
+diff --git a/fixtures/reports/diff/adjacent.diff b/fixtures/reports/diff/adjacent.diff
+new file mode 100644
+index 0000000..ba78db6
+--- /dev/null
++++ b/fixtures/reports/diff/adjacent.diff
+@@ -0,0 +1,7 @@
++diff --git a/doc b/doc
++--- a/doc
+++++ b/doc
++@@ -0,0 +1 @@
+++first
++@@ -1 +2 @@
++ a
+diff --git a/fixtures/reports/diff/blank_context.checks.json b/fixtures/reports/diff/blank_context.checks.json
+new file mode 100644
+index 0000000..6f55c12
+--- /dev/null
++++ b/fixtures/reports/diff/blank_context.checks.json
+@@ -0,0 +1,5 @@
++{
++  "/summary/hunks": 1,
++  "/rows/1/oldAt": 3,
++  "/rows/0/removed": 1
++}
+diff --git a/fixtures/reports/diff/blank_context.diff b/fixtures/reports/diff/blank_context.diff
+new file mode 100644
+index 0000000..35a0258
+--- /dev/null
++++ b/fixtures/reports/diff/blank_context.diff
+@@ -0,0 +1,9 @@
++diff --git a/doc b/doc
++--- a/doc
+++++ b/doc
++@@ -1,3 +1,3 @@
++-a
+++b
++
++-c
+++d
+diff --git a/fixtures/reports/diff/legacy.checks.json b/fixtures/reports/diff/legacy.checks.json
+new file mode 100644
+index 0000000..6e96e32
+--- /dev/null
++++ b/fixtures/reports/diff/legacy.checks.json
+@@ -0,0 +1,5 @@
++{
++  "/summary/files": 1,
++  "/rows/0/oldAt": 2,
++  "/rows/0/heading": "title"
++}
+diff --git a/fixtures/reports/diff/legacy.diff b/fixtures/reports/diff/legacy.diff
+new file mode 100644
+index 0000000..4ed9307
+--- /dev/null
++++ b/fixtures/reports/diff/legacy.diff
+@@ -0,0 +1,6 @@
++--- a/a
+++++ b/a
++@@ -1,2 +1,2 @@ title
++ keep
++-out
+++in
+diff --git a/fixtures/reports/diff/mailbox.checks.json b/fixtures/reports/diff/mailbox.checks.json
+new file mode 100644
+index 0000000..b44a858
+--- /dev/null
++++ b/fixtures/reports/diff/mailbox.checks.json
+@@ -0,0 +1,5 @@
++{
++  "/summary/files": 2,
++  "/summary/added": 2,
++  "/rows/1/hunk": 1
++}
+diff --git a/fixtures/reports/diff/mailbox.diff b/fixtures/reports/diff/mailbox.diff
+new file mode 100644
+index 0000000000000000000000000000000000000000..e5cb80c06d9326fd5b55262ad507c6628784524b
+GIT binary patch
+literal 381
+zcmc(a!3x4K5Jd0$6>|@%O(;}6RfOV25b8}lr0u3wXj9S%e!gw+1N7uFEX?i>%PYMb
+zkbYM=PHsfS6I8xrc2Ur2s;GL_4{pK^*Yo~zINsoSay}4ADe;0`zYILjremVEw-!=%
+zeSq1tu0g%_cp5zkAwILBfK(6)MX~HbqPd%~<2D+dWLc6@`2)iCKL{E^M}(TK^Gw3n
+Gz@FZY9AN4I
+
+literal 0
+HcmV?d00001
+
+diff --git a/fixtures/reports/diff/mailbox_line.checks.json b/fixtures/reports/diff/mailbox_line.checks.json
+new file mode 100644
+index 0000000..a11acd3
+--- /dev/null
++++ b/fixtures/reports/diff/mailbox_line.checks.json
+@@ -0,0 +1,3 @@
++{
++  "errorLine": 9
++}
+diff --git a/fixtures/reports/diff/mailbox_line.diff b/fixtures/reports/diff/mailbox_line.diff
+new file mode 100644
+index 0000000..a290110
+--- /dev/null
++++ b/fixtures/reports/diff/mailbox_line.diff
+@@ -0,0 +1,9 @@
++From 0000000000000000000000000000000000000007 Mon Sep 17 00:00:00 2001
++Subject: [PATCH] report
++
++--- x from message
++
++diff --git a/doc b/doc
++--- a/doc
+++++ b/doc
++@@ invalid
+diff --git a/fixtures/reports/diff/new_overlap.checks.json b/fixtures/reports/diff/new_overlap.checks.json
+new file mode 100644
+index 0000000..8566f07
+--- /dev/null
++++ b/fixtures/reports/diff/new_overlap.checks.json
+@@ -0,0 +1,3 @@
++{
++  "errorLine": 7
++}
+diff --git a/fixtures/reports/diff/new_overlap.diff b/fixtures/reports/diff/new_overlap.diff
+new file mode 100644
+index 0000000..1812736
+--- /dev/null
++++ b/fixtures/reports/diff/new_overlap.diff
+@@ -0,0 +1,8 @@
++diff --git a/doc b/doc
++--- a/doc
+++++ b/doc
++@@ -1,0 +5,2 @@
+++a
+++b
++@@ -2,0 +6 @@
+++c
+diff --git a/fixtures/reports/diff/overlap.checks.json b/fixtures/reports/diff/overlap.checks.json
+new file mode 100644
+index 0000000..8566f07
+--- /dev/null
++++ b/fixtures/reports/diff/overlap.checks.json
+@@ -0,0 +1,3 @@
++{
++  "errorLine": 7
++}
+diff --git a/fixtures/reports/diff/overlap.diff b/fixtures/reports/diff/overlap.diff
+new file mode 100644
+index 0000000..30a6856
+--- /dev/null
++++ b/fixtures/reports/diff/overlap.diff
+@@ -0,0 +1,8 @@
++diff --git a/doc b/doc
++--- a/doc
+++++ b/doc
++@@ -4,2 +2,2 @@
++ a
++ b
++@@ -5 +7 @@
++ c
+diff --git a/fixtures/reports/diff/transfer.checks.json b/fixtures/reports/diff/transfer.checks.json
+new file mode 100644
+index 0000000..9f22cfb
+--- /dev/null
++++ b/fixtures/reports/diff/transfer.checks.json
+@@ -0,0 +1,14 @@
++{
++  "/rows/0": {
++    "kind": "rename",
++    "old": "pλ",
++    "new": "qλ"
++  },
++  "/rows/1": {
++    "kind": "copy",
++    "old": "x",
++    "new": "y"
++  },
++  "/summary/files": 2,
++  "/rows/2/new": "y"
++}
+diff --git a/fixtures/reports/diff/transfer.diff b/fixtures/reports/diff/transfer.diff
+new file mode 100644
+index 0000000..fd8e8d5
+--- /dev/null
++++ b/fixtures/reports/diff/transfer.diff
+@@ -0,0 +1,14 @@
++diff --git a/p b/q
++similarity index 100%
++rename from "p\316\273"
++rename to "q\316\273"
++diff --git a/x b/y
++similarity index 88%
++copy from x
++copy to y
++index 1..2
++--- a/x
+++++ b/y
++@@ -1 +1 @@
++-a
+++b
+diff --git a/fixtures/reports/lcov/alias_scope.checks.json b/fixtures/reports/lcov/alias_scope.checks.json
+new file mode 100644
+index 0000000..911b302
+--- /dev/null
++++ b/fixtures/reports/lcov/alias_scope.checks.json
+@@ -0,0 +1,3 @@
++{
++  "errorLine": 5
++}
+diff --git a/fixtures/reports/lcov/alias_scope.lcov b/fixtures/reports/lcov/alias_scope.lcov
+new file mode 100644
+index 0000000..9217a48
+--- /dev/null
++++ b/fixtures/reports/lcov/alias_scope.lcov
+@@ -0,0 +1,6 @@
++SF:x
++FNL:7,1
++end_of_record
++SF:y
++FNA:7,8,stale
++end_of_record
+diff --git a/fixtures/reports/lcov/aliases.checks.json b/fixtures/reports/lcov/aliases.checks.json
+new file mode 100644
+index 0000000..f86261a
+--- /dev/null
++++ b/fixtures/reports/lcov/aliases.checks.json
+@@ -0,0 +1,9 @@
++{
++  "/rows/0/functions": 2,
++  "/rows/0/uncoveredFunctions": [
++    "alias"
++  ],
++  "/rows/1/uncoveredFunctions": [
++    "other"
++  ]
++}
+diff --git a/fixtures/reports/lcov/aliases.lcov b/fixtures/reports/lcov/aliases.lcov
+new file mode 100644
+index 0000000..89301e6
+--- /dev/null
++++ b/fixtures/reports/lcov/aliases.lcov
+@@ -0,0 +1,9 @@
++SF:x
++FNL:7,4,8
++FNA:7,1,read,raw
++FNA:7,0,alias
++end_of_record
++SF:y
++FNL:7,11
++FNA:7,0,other
++end_of_record
+diff --git a/fixtures/reports/lcov/backwards.checks.json b/fixtures/reports/lcov/backwards.checks.json
+new file mode 100644
+index 0000000..a982349
+--- /dev/null
++++ b/fixtures/reports/lcov/backwards.checks.json
+@@ -0,0 +1,3 @@
++{
++  "errorLine": 2
++}
+diff --git a/fixtures/reports/lcov/backwards.lcov b/fixtures/reports/lcov/backwards.lcov
+new file mode 100644
+index 0000000..667d0d1
+--- /dev/null
++++ b/fixtures/reports/lcov/backwards.lcov
+@@ -0,0 +1,3 @@
++SF:x
++FN:7,2,parse
++end_of_record
+diff --git a/fixtures/reports/lcov/conflict.checks.json b/fixtures/reports/lcov/conflict.checks.json
+new file mode 100644
+index 0000000..e11ac7f
+--- /dev/null
++++ b/fixtures/reports/lcov/conflict.checks.json
+@@ -0,0 +1,3 @@
++{
++  "errorLine": 3
++}
+diff --git a/fixtures/reports/lcov/conflict.lcov b/fixtures/reports/lcov/conflict.lcov
+new file mode 100644
+index 0000000..986bb14
+--- /dev/null
++++ b/fixtures/reports/lcov/conflict.lcov
+@@ -0,0 +1,4 @@
++SF:x
++FN:3,8,parse
++FN:3,9,parse
++end_of_record
+diff --git a/fixtures/reports/lcov/legacy.checks.json b/fixtures/reports/lcov/legacy.checks.json
+new file mode 100644
+index 0000000..7cecff2
+--- /dev/null
++++ b/fixtures/reports/lcov/legacy.checks.json
+@@ -0,0 +1,12 @@
++{
++  "/rows/0/unknown": 1,
++  "/rows/0/gaps": [
++    [
++      1,
++      1
++    ]
++  ],
++  "/rows/0/uncoveredFunctions": [
++    "legacy,with comma"
++  ]
++}
+diff --git a/fixtures/reports/lcov/legacy.lcov b/fixtures/reports/lcov/legacy.lcov
+new file mode 100644
+index 0000000..ebfbe73
+--- /dev/null
++++ b/fixtures/reports/lcov/legacy.lcov
+@@ -0,0 +1,5 @@
++SF:./pkg/a.rs
++DA:1,0
++BRDA:2,0,0,-
++FNDA:0,legacy,with comma
++end_of_record
+diff --git a/fixtures/reports/lcov/named_run.checks.json b/fixtures/reports/lcov/named_run.checks.json
+new file mode 100644
+index 0000000..8c91e9b
+--- /dev/null
++++ b/fixtures/reports/lcov/named_run.checks.json
+@@ -0,0 +1,4 @@
++{
++  "/rows/0/hits": 0,
++  "/summary/records": 1
++}
+diff --git a/fixtures/reports/lcov/named_run.lcov b/fixtures/reports/lcov/named_run.lcov
+new file mode 100644
+index 0000000..bb3dd00
+--- /dev/null
++++ b/fixtures/reports/lcov/named_run.lcov
+@@ -0,0 +1,7 @@
++TN:retry
++SF:x
++DA:1,12
++end_of_record
++SF:x
++DA:2,0
++end_of_record
+diff --git a/fixtures/reports/lcov/ranges.checks.json b/fixtures/reports/lcov/ranges.checks.json
+new file mode 100644
+index 0000000..1d0e192
+--- /dev/null
++++ b/fixtures/reports/lcov/ranges.checks.json
+@@ -0,0 +1,4 @@
++{
++  "/rows/0/functions": 1,
++  "/rows/0/uncoveredFunctions": []
++}
+diff --git a/fixtures/reports/lcov/ranges.lcov b/fixtures/reports/lcov/ranges.lcov
+new file mode 100644
+index 0000000..a1cd125
+--- /dev/null
++++ b/fixtures/reports/lcov/ranges.lcov
+@@ -0,0 +1,5 @@
++SF:x
++FN:3,7,parse,inner
++FNDA:6,parse,inner
++FN:3,parse,inner
++end_of_record
+diff --git a/fixtures/reports/lcov/retry.checks.json b/fixtures/reports/lcov/retry.checks.json
+new file mode 100644
+index 0000000..eb05e9d
+--- /dev/null
++++ b/fixtures/reports/lcov/retry.checks.json
+@@ -0,0 +1,5 @@
++{
++  "/summary/records": 3,
++  "/rows/0/lines": 2,
++  "/rows/0/hits": 6
++}
+diff --git a/fixtures/reports/lcov/retry.lcov b/fixtures/reports/lcov/retry.lcov
+new file mode 100644
+index 0000000..abab862
+--- /dev/null
++++ b/fixtures/reports/lcov/retry.lcov
+@@ -0,0 +1,17 @@
++TN:one
++SF:a
++DA:1,10
++DA:4,7
++end_of_record
++TN:two
++SF:a
++DA:3,3
++end_of_record
++TN:one
++SF:./a
++DA:2,2
++end_of_record
++TN:
++SF:a
++DA:2,1
++end_of_record
+diff --git a/fixtures/reports/lcov/runners.checks.json b/fixtures/reports/lcov/runners.checks.json
+new file mode 100644
+index 0000000..fa6494c
+--- /dev/null
++++ b/fixtures/reports/lcov/runners.checks.json
+@@ -0,0 +1,6 @@
++{
++  "/summary/files": 2,
++  "/rows/0/path": "//srv/share/pkg.rs",
++  "/rows/1/path": "C:/src/lib.rs",
++  "/rows/1/hits": 5
++}
+diff --git a/fixtures/reports/lcov/runners.lcov b/fixtures/reports/lcov/runners.lcov
+new file mode 100644
+index 0000000..fb2402a
+--- /dev/null
++++ b/fixtures/reports/lcov/runners.lcov
+@@ -0,0 +1,8 @@
++SF:c:\src\x\..\lib.rs
++DA:1,2
++end_of_record
++SF:C:/src/lib.rs
++DA:1,3
++end_of_record
++SF:\\srv\share\..\..\pkg.rs
++end_of_record
+diff --git a/fixtures/reports/tap/attachment.checks.json b/fixtures/reports/tap/attachment.checks.json
+new file mode 100644
+index 0000000..0e4de21
+--- /dev/null
++++ b/fixtures/reports/tap/attachment.checks.json
+@@ -0,0 +1,7 @@
++{
++  "/rows/0/diagnostic": [
++    "detail: |",
++    "  ...",
++    ""
++  ]
++}
+diff --git a/fixtures/reports/tap/attachment.tap b/fixtures/reports/tap/attachment.tap
+new file mode 100644
+index 0000000..d30f175
+--- /dev/null
++++ b/fixtures/reports/tap/attachment.tap
+@@ -0,0 +1,7 @@
++not ok - child
++    ---
++    detail: |
++      ...
++
++    ...
++1..1
+diff --git a/fixtures/reports/tap/block.checks.json b/fixtures/reports/tap/block.checks.json
+new file mode 100644
+index 0000000..7f8a715
+--- /dev/null
++++ b/fixtures/reports/tap/block.checks.json
+@@ -0,0 +1,8 @@
++{
++  "/rows/0/scope": [
++    "parent"
++  ],
++  "/rows/1/subtest": true,
++  "/summary/fail": 1,
++  "/summary/pass": 1
++}
+diff --git a/fixtures/reports/tap/block.tap b/fixtures/reports/tap/block.tap
+new file mode 100644
+index 0000000..8f1d970
+--- /dev/null
++++ b/fixtures/reports/tap/block.tap
+@@ -0,0 +1,5 @@
++ok 1 - parent {
++    not ok 1 - leaf
++    1..1
++}
++1..1
+diff --git a/fixtures/reports/tap/escaped_scope.checks.json b/fixtures/reports/tap/escaped_scope.checks.json
+new file mode 100644
+index 0000000..4f8c651
+--- /dev/null
++++ b/fixtures/reports/tap/escaped_scope.checks.json
+@@ -0,0 +1,6 @@
++{
++  "/rows/0/scope": [
++    "suite#a"
++  ],
++  "/rows/1/name": "suite#a"
++}
+diff --git a/fixtures/reports/tap/escaped_scope.tap b/fixtures/reports/tap/escaped_scope.tap
+new file mode 100644
+index 0000000..d38e7ae
+--- /dev/null
++++ b/fixtures/reports/tap/escaped_scope.tap
+@@ -0,0 +1,5 @@
++# Subtest: suite\#a
++    ok 1 x
++    1..1
++ok 1 suite\#a
++1..1
+diff --git a/fixtures/reports/tap/escapes.checks.json b/fixtures/reports/tap/escapes.checks.json
+new file mode 100644
+index 0000000..fbf98f4
+--- /dev/null
++++ b/fixtures/reports/tap/escapes.checks.json
+@@ -0,0 +1,4 @@
++{
++  "/rows/0/name": "file#name\\part\\q",
++  "/rows/0/reason": "inspect"
++}
+diff --git a/fixtures/reports/tap/escapes.tap b/fixtures/reports/tap/escapes.tap
+new file mode 100644
+index 0000000..bdfa1f4
+--- /dev/null
++++ b/fixtures/reports/tap/escapes.tap
+@@ -0,0 +1,2 @@
++not ok 1 - file\#name\\part\q # TODO inspect
++1..1
+diff --git a/fixtures/reports/tap/lane_error.checks.json b/fixtures/reports/tap/lane_error.checks.json
+new file mode 100644
+index 0000000..e11ac7f
+--- /dev/null
++++ b/fixtures/reports/tap/lane_error.checks.json
+@@ -0,0 +1,3 @@
++{
++  "errorLine": 3
++}
+diff --git a/fixtures/reports/tap/lane_error.tap b/fixtures/reports/tap/lane_error.tap
+new file mode 100644
+index 0000000..e5e54cc
+--- /dev/null
++++ b/fixtures/reports/tap/lane_error.tap
+@@ -0,0 +1,3 @@
++[r] ok one
++[g] 1..0
++[r] ok 4 - bad
+diff --git a/fixtures/reports/tap/lanes.checks.json b/fixtures/reports/tap/lanes.checks.json
+new file mode 100644
+index 0000000..5a19779
+--- /dev/null
++++ b/fixtures/reports/tap/lanes.checks.json
+@@ -0,0 +1,6 @@
++{
++  "/rows/0/lane": "z",
++  "/rows/0/name": "last",
++  "/rows/1/lane": "a",
++  "/summary/pass": 2
++}
+diff --git a/fixtures/reports/tap/lanes.tap b/fixtures/reports/tap/lanes.tap
+new file mode 100644
+index 0000000..d72ef7f
+--- /dev/null
++++ b/fixtures/reports/tap/lanes.tap
+@@ -0,0 +1,5 @@
++[z] TAP version 13
++[a] ok 1 - first
++[z] ok 1 - last
++[a] 1..1
++[z] 1..1
+diff --git a/fixtures/reports/tap/legacy.checks.json b/fixtures/reports/tap/legacy.checks.json
+new file mode 100644
+index 0000000..085fd75
+--- /dev/null
++++ b/fixtures/reports/tap/legacy.checks.json
+@@ -0,0 +1,5 @@
++{
++  "/rows/1/subtest": true,
++  "/summary/todo": 1,
++  "/rows/0/reason": "repair"
++}
+diff --git a/fixtures/reports/tap/legacy.tap b/fixtures/reports/tap/legacy.tap
+new file mode 100644
+index 0000000..70ca662
+--- /dev/null
++++ b/fixtures/reports/tap/legacy.tap
+@@ -0,0 +1,5 @@
++# Subtest: child
++    not ok x # todo repair
++    1..1
++ok 1 child
++1..1
+diff --git a/fixtures/reports/tap/unclosed.checks.json b/fixtures/reports/tap/unclosed.checks.json
+new file mode 100644
+index 0000000..e11ac7f
+--- /dev/null
++++ b/fixtures/reports/tap/unclosed.checks.json
+@@ -0,0 +1,3 @@
++{
++  "errorLine": 3
++}
+diff --git a/fixtures/reports/tap/unclosed.tap b/fixtures/reports/tap/unclosed.tap
+new file mode 100644
+index 0000000..2f59a44
+--- /dev/null
++++ b/fixtures/reports/tap/unclosed.tap
+@@ -0,0 +1,3 @@
++ok 1 - parent {
++    1..0
++1..1
+diff --git a/src/cli.rs b/src/cli.rs
+index 7d132e3..8079433 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -118,6 +118,7 @@ fn build(tool: &str, args: &[String]) -> Result<Value, String> {
+ 
+ pub fn run(args: &[String]) -> i32 {
+     let tool = match args.first().map(String::as_str) {
++        Some("inspect") => "inspect_report",
+         Some("search") => "batch_search",
+         Some("outline") => "quick_outline",
+         Some("slices") => "read_slices",
+diff --git a/src/tools/mod.rs b/src/tools/mod.rs
+index 635f7d2..251c40a 100644
+--- a/src/tools/mod.rs
++++ b/src/tools/mod.rs
+@@ -1,6 +1,7 @@
+ pub mod check;
+ pub mod edit;
+ pub mod outline;
++pub mod report;
+ pub mod search;
+ pub mod slices;
+ pub mod snapshot;
+@@ -27,6 +28,7 @@ fn unwrap_stringified(args: &mut Value) {
+ pub fn call(name: &str, mut args: Value) -> Result<String, String> {
+     unwrap_stringified(&mut args);
+     let result = match name {
++        "inspect_report" => report::run(args),
+         "batch_search" => search::run(args),
+         "quick_outline" => outline::run(args),
+         "read_slices" => slices::run(args),
+diff --git a/src/tools/report/diff/header.rs b/src/tools/report/diff/header.rs
+new file mode 100644
+index 0000000..78cb6ab
+--- /dev/null
++++ b/src/tools/report/diff/header.rs
+@@ -0,0 +1,34 @@
++fn number(raw: &str) -> Option<u64> {
++    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
++        return None;
++    }
++    raw.parse().ok()
++}
++
++#[derive(Clone, Copy)]
++pub(super) struct Range {
++    pub(super) start: u64,
++    pub(super) count: u64,
++}
++
++fn range(raw: &str, prefix: char) -> Option<Range> {
++    let spec = raw.strip_prefix(prefix)?;
++    let (start, count) = spec.split_once(',').unwrap_or((spec, "1"));
++    let (start, count) = (number(start)?, number(count)?);
++    if start == 0 && count != 0 {
++        return None;
++    }
++    start.checked_add(count)?;
++    Some(Range { start, count })
++}
++
++pub(super) fn header(raw: &str) -> Option<(Range, Range, &str)> {
++    let (coords, tail) = raw.strip_prefix("@@ ")?.split_once(" @@")?;
++    let (left, right) = coords.split_once(' ')?;
++    let heading = if tail.is_empty() {
++        ""
++    } else {
++        tail.strip_prefix(' ')?
++    };
++    Some((range(left, '-')?, range(right, '+')?, heading))
++}
+diff --git a/src/tools/report/diff/mod.rs b/src/tools/report/diff/mod.rs
+new file mode 100644
+index 0000000..1dd8c46
+--- /dev/null
++++ b/src/tools/report/diff/mod.rs
+@@ -0,0 +1,125 @@
++mod header;
++mod paths;
++mod regions;
++use super::Report;
++use header::{Range, header};
++use paths::path;
++use regions::body;
++use serde_json::{Value, json};
++
++fn error(line: usize, why: &str) -> String {
++    format!("diff line {line}: {why}")
++}
++
++#[derive(Default)]
++struct Totals {
++    files: usize,
++    hunks: usize,
++    added: u64,
++    removed: u64,
++}
++
++struct Hunk<'a> {
++    old: &'a Option<String>,
++    new: &'a Option<String>,
++    id: usize,
++    heading: &'a str,
++}
++
++pub(super) fn parse(src: &str) -> Result<Report, String> {
++    // A mailed patch begins with an envelope and a human-readable cover letter.
++    let mut lines: Vec<_> = src.lines().collect();
++    if lines.first().is_some_and(|line| line.starts_with("From "))
++        && let Some(start) = lines
++            .iter()
++            .position(|line| line.starts_with("diff --git "))
++    {
++        lines.drain(..start);
++    }
++    let mut pos = 0;
++    let mut totals = Totals::default();
++    let mut rows = Vec::new();
++    while pos < lines.len() {
++        let line = lines[pos];
++        if line.is_empty()
++            || [
++                "diff --git ",
++                "index ",
++                "new file mode ",
++                "deleted file mode ",
++            ]
++            .iter()
++            .any(|prefix| line.starts_with(prefix))
++        {
++            pos += 1;
++            continue;
++        }
++        let old = path(
++            line.strip_prefix("--- ")
++                .ok_or_else(|| error(pos + 1, "expected --- path"))?,
++            "a/",
++            pos + 1,
++        )?;
++        pos += 1;
++        let raw = lines
++            .get(pos)
++            .and_then(|s| s.strip_prefix("+++ "))
++            .ok_or_else(|| error(pos + 1, "expected +++ path"))?;
++        let new = path(raw, "b/", pos + 1)?;
++        if new.is_none() && old.is_none() {
++            return Err(error(pos + 1, "two null paths"));
++        }
++        pos += 1;
++        totals.files += 1;
++        let mut id = 0;
++        while let Some(line) = lines.get(pos).filter(|s| s.starts_with("@@")) {
++            let (left, right, heading) =
++                header(line).ok_or_else(|| error(pos + 1, "invalid hunk header"))?;
++            pos += 1;
++            id += 1;
++            totals.hunks += 1;
++            body(
++                &lines,
++                &mut pos,
++                left,
++                right,
++                Hunk {
++                    old: &old,
++                    new: &new,
++                    id,
++                    heading,
++                },
++                &mut rows,
++                &mut totals,
++            )?;
++        }
++    }
++    Ok(Report {
++        rows,
++        summary: json!({"files":totals.files, "hunks":totals.hunks,
++        "added":totals.added, "removed":totals.removed}),
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn diff_marker_between_edits() {
++        let r = parse("--- a/x\n+++ b/x\n@@ -10 +20 @@ f\n-x\n\\ No newline at end of file\n+y")
++            .unwrap();
++        assert_eq!(r.rows.len(), 1);
++        assert_eq!(r.rows[0]["oldAt"], 10);
++        assert_eq!(r.rows[0]["added"], 1);
++    }
++
++    #[test]
++    fn diff_quoted_utf8_path() {
++        assert_eq!(
++            path(r#""a/\316\273""#, "a/", 1).unwrap().as_deref(),
++            Some("λ")
++        );
++        assert!(path(r#""a/\377""#, "a/", 1).is_err());
++    }
++}
+diff --git a/src/tools/report/diff/paths.rs b/src/tools/report/diff/paths.rs
+new file mode 100644
+index 0000000..49cfe7e
+--- /dev/null
++++ b/src/tools/report/diff/paths.rs
+@@ -0,0 +1,46 @@
++use super::error;
++/// A quoted Git path encodes bytes, so octal escapes must be decoded
++/// before checking UTF-8 (a scalar can span several escapes).
++fn quoted_path(raw: &str) -> Option<String> {
++    let body = raw.strip_prefix('"')?.strip_suffix('"')?;
++    let mut bytes = body.bytes();
++    let mut out = Vec::new();
++    while let Some(b) = bytes.next() {
++        match b {
++            b'"' => return None,
++            b'\\' => match bytes.next()? {
++                b @ (b'\\' | b'"') => out.push(b),
++                b't' => out.push(b'\t'),
++                b'n' => out.push(b'\n'),
++                a @ b'0'..=b'3' => {
++                    let b = bytes.next()?.checked_sub(b'0')?;
++                    let c = bytes.next()?.checked_sub(b'0')?;
++                    if b > 7 || c > 7 {
++                        return None;
++                    }
++                    out.push((a - b'0') * 64 + b * 8 + c);
++                }
++                _ => return None,
++            },
++            _ => out.push(b),
++        }
++    }
++    String::from_utf8(out).ok()
++}
++
++pub(super) fn path(raw: &str, prefix: &str, line: usize) -> Result<Option<String>, String> {
++    let field = raw.split('\t').next().unwrap_or("");
++    let value = if field.starts_with('"') {
++        quoted_path(field).ok_or_else(|| error(line, "bad quoted path"))?
++    } else {
++        field.to_owned()
++    };
++    if value == "/dev/null" {
++        return Ok(None);
++    }
++    let name = value.strip_prefix(prefix).unwrap_or(&value);
++    if name.is_empty() {
++        return Err(error(line, "empty path"));
++    }
++    Ok(Some(name.to_owned()))
++}
+diff --git a/src/tools/report/diff/regions.rs b/src/tools/report/diff/regions.rs
+new file mode 100644
+index 0000000..8bc8a30
+--- /dev/null
++++ b/src/tools/report/diff/regions.rs
+@@ -0,0 +1,76 @@
++use super::*;
++#[derive(Default)]
++struct Edit {
++    old_at: u64,
++    new_at: u64,
++    removed: u64,
++    added: u64,
++}
++
++impl Edit {
++    fn flush(&mut self, hunk: &Hunk<'_>, rows: &mut Vec<Value>) {
++        if self.removed == 0 && self.added == 0 {
++            return;
++        }
++        rows.push(json!({
++            "old":hunk.old, "new":hunk.new, "hunk":hunk.id, "heading":hunk.heading,
++            "oldAt":self.old_at, "newAt":self.new_at, "removed":self.removed, "added":self.added,
++        }));
++        *self = Self::default();
++    }
++}
++
++const MARKER: &str = "\\ No newline at end of file";
++
++pub(super) fn body(
++    lines: &[&str],
++    pos: &mut usize,
++    old: Range,
++    new: Range,
++    h: Hunk<'_>,
++    rows: &mut Vec<Value>,
++    totals: &mut Totals,
++) -> Result<(), String> {
++    let (mut left, mut right) = (0, 0);
++    let mut edit = Edit::default();
++    let mut marker_allowed = false;
++    loop {
++        let line = lines.get(*pos).copied();
++        if line == Some(MARKER) && marker_allowed {
++            *pos += 1;
++            marker_allowed = false;
++            continue;
++        }
++        if (left, right) == (old.count, new.count) {
++            break;
++        }
++        let n = *pos + 1;
++        let op = line.and_then(|s| s.as_bytes().first()).copied();
++        if edit.added == 0 && edit.removed == 0 {
++            edit.old_at = old.start + left;
++            edit.new_at = new.start + right;
++        }
++        match op {
++            Some(b' ') if left < old.count && right < new.count => {
++                edit.flush(&h, rows);
++                left += 1;
++                right += 1;
++            }
++            Some(b'-') if left < old.count => {
++                edit.removed += 1;
++                totals.removed += 1;
++                left += 1;
++            }
++            Some(b'+') if right < new.count => {
++                edit.added += 1;
++                totals.added += 1;
++                right += 1;
++            }
++            _ => return Err(error(n, "hunk body does not match ranges")),
++        }
++        *pos += 1;
++        marker_allowed = true;
++    }
++    edit.flush(&h, rows);
++    Ok(())
++}
+diff --git a/src/tools/report/lcov/mod.rs b/src/tools/report/lcov/mod.rs
+new file mode 100644
+index 0000000..ab6c5c2
+--- /dev/null
++++ b/src/tools/report/lcov/mod.rs
+@@ -0,0 +1,106 @@
++mod paths;
++mod source;
++use super::Report;
++use paths::filename;
++use serde_json::{Value, json};
++use source::Source;
++use std::collections::BTreeMap;
++
++type Parsed<T> = Result<T, &'static str>;
++
++fn integer(raw: &str) -> Parsed<u64> {
++    if raw.is_empty() || !raw.bytes().all(|c| c.is_ascii_digit()) {
++        return Err("expected unsigned decimal");
++    }
++    raw.parse().map_err(|_| "integer overflow")
++}
++
++fn coordinate(raw: &str) -> Parsed<u64> {
++    match integer(raw)? {
++        0 => Err("line zero"),
++        n => Ok(n),
++    }
++}
++
++#[derive(Default)]
++struct Reader {
++    files: BTreeMap<String, Source>,
++    current: Option<String>,
++    records: usize,
++}
++
++impl Reader {
++    fn line(&mut self, line: &str) -> Parsed<()> {
++        if line.is_empty() || line.starts_with("TN:") {
++            return Ok(());
++        }
++        if line == "end_of_record" {
++            self.current.take().ok_or("unmatched end_of_record")?;
++            self.records += 1;
++            return Ok(());
++        }
++        let (tag, raw) = line.split_once(':').ok_or("missing field separator")?;
++        if tag == "SF" {
++            if self.current.is_some() {
++                return Err("nested source record");
++            }
++            let path = filename(raw)?;
++            self.files.entry(path.clone()).or_default();
++            self.current = Some(path);
++            return Ok(());
++        }
++        let path = self.current.as_ref().ok_or("field outside source record")?;
++        let source = self.files.get_mut(path).expect("registered on SF");
++        match tag {
++            "DA" => source.add_line(raw),
++            "FN" | "FNDA" => source.function(raw, tag == "FN"),
++            "BRDA" => source.branch(raw),
++            "LF" | "LH" | "FNF" | "FNH" | "BRF" | "BRH" => Ok(()),
++            _ => Err("unsupported field"),
++        }
++    }
++}
++
++pub(super) fn parse(src: &str) -> Result<Report, String> {
++    let mut reader = Reader::default();
++    let mut last = 0;
++    for (index, line) in src.lines().enumerate() {
++        last = index + 1;
++        reader
++            .line(line)
++            .map_err(|e| format!("lcov line {last}: {e}"))?;
++    }
++    if reader.current.is_some() {
++        return Err(format!("lcov line {}: missing end_of_record", last + 1));
++    }
++    let rows: Vec<_> = reader
++        .files
++        .iter()
++        .map(|(path, file)| file.row(path))
++        .collect();
++    let lines: usize = reader.files.values().map(Source::lines).sum();
++    let covered: usize = reader.files.values().map(Source::covered).sum();
++    Ok(Report {
++        summary: json!({"files":rows.len(),"records":reader.records,"lines":lines,"covered":covered}),
++        rows,
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn lcov_merge_checksums() {
++        let data = "SF:x\nDA:2,0,one\nend_of_record\nSF:./x\nDA:2,1,two\nend_of_record";
++        assert!(parse(data).err().unwrap().starts_with("lcov line 5:"));
++    }
++
++    #[test]
++    fn lcov_unknown_branch() {
++        let report = parse("SF:x\nBRDA:3,0,0,-\nBRDA:3,0,0,0\nend_of_record").unwrap();
++        assert_eq!(report.rows[0]["unknown"], 0);
++        assert_eq!(report.rows[0]["taken"], 0);
++        assert_eq!(report.rows[0]["branches"], 1);
++    }
++}
+diff --git a/src/tools/report/lcov/paths.rs b/src/tools/report/lcov/paths.rs
+new file mode 100644
+index 0000000..3e52ba3
+--- /dev/null
++++ b/src/tools/report/lcov/paths.rs
+@@ -0,0 +1,26 @@
++use super::Parsed;
++pub(super) fn filename(raw: &str) -> Parsed<String> {
++    // Coverage exporters on Windows may use either separator.
++    let slashes = raw.replace('\\', "/");
++    let raw = slashes.as_str();
++    let absolute = raw.starts_with('/');
++    let mut parts = Vec::new();
++    for component in raw.split('/') {
++        match component {
++            "" | "." => {}
++            ".." if parts.last().is_some_and(|p| *p != "..") => {
++                parts.pop();
++            }
++            ".." if absolute => {}
++            _ => parts.push(component),
++        }
++    }
++    if parts.is_empty() {
++        return Err("empty source path");
++    }
++    Ok(format!(
++        "{}{}",
++        if absolute { "/" } else { "" },
++        parts.join("/")
++    ))
++}
+diff --git a/src/tools/report/lcov/source.rs b/src/tools/report/lcov/source.rs
+new file mode 100644
+index 0000000..277e5b0
+--- /dev/null
++++ b/src/tools/report/lcov/source.rs
+@@ -0,0 +1,116 @@
++use super::*;
++#[derive(Default)]
++struct Line {
++    hits: u64,
++    checksum: Option<String>,
++}
++
++#[derive(Default)]
++struct Function {
++    declaration: Option<u64>,
++    hits: u64,
++}
++
++#[derive(Default)]
++pub(super) struct Source {
++    lines: BTreeMap<u64, Line>,
++    functions: BTreeMap<String, Function>,
++    branches: BTreeMap<(u64, u64, u64), Option<u64>>,
++}
++
++impl Source {
++    pub(super) fn add_line(&mut self, raw: &str) -> Parsed<()> {
++        let mut fields = raw.split(',');
++        let pos = coordinate(fields.next().unwrap_or(""))?;
++        let hits = integer(fields.next().ok_or("missing hit count")?)?;
++        let checksum = fields.next();
++        if fields.next().is_some() || checksum == Some("") {
++            return Err("invalid DA checksum");
++        }
++        let line = self.lines.entry(pos).or_default();
++        if let Some(value) = checksum {
++            if line.checksum.as_deref().is_some_and(|old| old != value) {
++                return Err("conflicting checksum");
++            }
++            line.checksum = Some(value.into());
++        }
++        line.hits = line.hits.saturating_add(hits);
++        Ok(())
++    }
++
++    pub(super) fn function(&mut self, raw: &str, declaration: bool) -> Parsed<()> {
++        let (value, name) = raw.split_once(',').ok_or("missing function name")?;
++        if name.is_empty() {
++            return Err("empty function name");
++        }
++        let function = self.functions.entry(name.to_owned()).or_default();
++        if declaration {
++            let line = coordinate(value)?;
++            if function.declaration.is_some_and(|old| old != line) {
++                return Err("conflicting function declaration");
++            }
++            function.declaration = Some(line);
++        } else {
++            function.hits = function.hits.saturating_add(integer(value)?);
++        }
++        Ok(())
++    }
++
++    pub(super) fn branch(&mut self, raw: &str) -> Parsed<()> {
++        let fields: Vec<_> = raw.split(',').collect();
++        let [line, block, branch, taken] = fields.as_slice() else {
++            return Err("invalid BRDA");
++        };
++        let counts = self
++            .branches
++            .entry((coordinate(line)?, integer(block)?, integer(branch)?))
++            .or_default();
++        if *taken != "-" {
++            *counts = Some(counts.unwrap_or(0).saturating_add(integer(taken)?));
++        }
++        Ok(())
++    }
++
++    fn gaps(&self) -> Vec<[u64; 2]> {
++        let mut gaps: Vec<[u64; 2]> = Vec::new();
++        for (&line, _) in self.lines.iter().filter(|(_, data)| data.hits == 0) {
++            if let Some(last) = gaps.last_mut()
++                && last[1].checked_add(1) == Some(line)
++            {
++                last[1] = line;
++            } else {
++                gaps.push([line, line]);
++            }
++        }
++        gaps
++    }
++
++    pub(super) fn lines(&self) -> usize {
++        self.lines.len()
++    }
++    pub(super) fn covered(&self) -> usize {
++        self.lines.values().filter(|l| l.hits > 0).count()
++    }
++
++    pub(super) fn row(&self, path: &str) -> Value {
++        let uncovered: Vec<_> = self
++            .functions
++            .iter()
++            .filter(|(_, f)| f.hits == 0)
++            .map(|(name, _)| name)
++            .collect();
++        let mut hits = 0u64;
++        for line in self.lines.values() {
++            hits = hits.saturating_add(line.hits);
++        }
++        json!({
++            "path":path, "lines":self.lines.len(),
++            "covered":self.lines.values().filter(|l| l.hits > 0).count(),
++            "hits": hits, "gaps":self.gaps(),
++            "functions":self.functions.len(), "uncoveredFunctions":uncovered,
++            "branches":self.branches.len(),
++            "taken":self.branches.values().filter(|v| v.is_some_and(|n| n > 0)).count(),
++            "unknown":self.branches.values().filter(|v| v.is_none()).count(),
++        })
++    }
++}
+diff --git a/src/tools/report/mod.rs b/src/tools/report/mod.rs
+new file mode 100644
+index 0000000..0adad73
+--- /dev/null
++++ b/src/tools/report/mod.rs
+@@ -0,0 +1,51 @@
++//! Read-only report inspection. Format adapters own parsing and ordering.
++//! The transport keeps a prefix of complete rows and preserves full totals.
++mod diff;
++mod lcov;
++mod tap;
++
++use crate::core::{budget, cwd};
++use serde::Deserialize;
++use serde_json::{Value, json};
++
++pub(super) struct Report {
++    pub summary: Value,
++    pub rows: Vec<Value>,
++}
++
++#[derive(Deserialize)]
++#[serde(rename_all = "camelCase")]
++struct Request {
++    cwd: Option<String>,
++    path: String,
++    format: String,
++    max_chars: Option<usize>,
++}
++
++pub fn run(args: Value) -> Result<String, String> {
++    let req: Request = serde_json::from_value(args).map_err(|e| e.to_string())?;
++    let dir = cwd::resolve(req.cwd.as_deref())?;
++    let src = crate::tools::outline::read_text(&dir.join(req.path))?;
++    let report = match req.format.as_str() {
++        "diff" => diff::parse(&src),
++        "lcov" => lcov::parse(&src),
++        "tap" => tap::parse(&src),
++        _ => return Err("unknown report format".into()),
++    }?;
++    let cap = budget::limit(req.max_chars, 512);
++    let render = |n: usize| json!({
++        "summary": report.summary,
++        "rows": &report.rows[..n],
++        "omitted": report.rows.len() - n,
++    }).to_string();
++    // Serialized prefix size is monotone: a row adds at least one byte
++    // even when the decimal omission count loses a digit.
++    let (mut lo, mut hi) = (0, report.rows.len());
++    while lo < hi {
++        let mid = lo + (hi - lo).div_ceil(2);
++        if render(mid).len() <= cap { lo = mid } else { hi = mid - 1 }
++    }
++    let text = render(lo);
++    if text.len() > cap { return Err("summary exceeds report budget".into()); }
++    Ok(text)
++}
+diff --git a/src/tools/report/tap/diagnostic.rs b/src/tools/report/tap/diagnostic.rs
+new file mode 100644
+index 0000000..328851e
+--- /dev/null
++++ b/src/tools/report/tap/diagnostic.rs
+@@ -0,0 +1,26 @@
++use super::*;
++impl<'a> Reader<'a> {
++    pub(super) fn diagnostic(&mut self, depth: usize) -> Result<Vec<&'a str>, String> {
++        let indent = depth * 4 + 2;
++        let mut data = Vec::new();
++        let deindent = |line: &'a str| {
++            line.get(..indent)
++                .filter(|s| s.bytes().all(|b| b == b' '))
++                .map(|_| &line[indent..])
++        };
++        if self.lines.get(self.pos).and_then(|s| deindent(s)) != Some("---") {
++            return Ok(data);
++        }
++        self.pos += 1;
++        while let Some(line) = self.lines.get(self.pos) {
++            let body =
++                deindent(line).ok_or_else(|| error(self.pos + 1, "diagnostic indentation"))?;
++            self.pos += 1;
++            if body == "..." {
++                return Ok(data);
++            }
++            data.push(body);
++        }
++        Err(error(self.pos + 1, "unterminated diagnostic"))
++    }
++}
+diff --git a/src/tools/report/tap/mod.rs b/src/tools/report/tap/mod.rs
+new file mode 100644
+index 0000000..afedc21
+--- /dev/null
++++ b/src/tools/report/tap/mod.rs
+@@ -0,0 +1,146 @@
++mod diagnostic;
++mod point;
++use super::Report;
++use point::{Point, count, directive, point};
++use serde_json::{Value, json};
++
++fn error(line: usize, text: &str) -> String {
++    format!("tap line {line}: {text}")
++}
++
++#[derive(Default)]
++struct Reader<'a> {
++    lines: Vec<&'a str>,
++    pos: usize,
++    rows: Vec<Value>,
++    passed: usize,
++    failed: usize,
++    skipped: usize,
++    todo: usize,
++}
++
++impl<'a> Reader<'a> {
++    fn record(
++        &mut self,
++        point: Point<'a>,
++        scope: &[&str],
++        number: usize,
++        diag: Vec<&str>,
++        child: bool,
++    ) {
++        match point.status {
++            "pass" => self.passed += 1,
++            "fail" => self.failed += 1,
++            "skip" => self.skipped += 1,
++            _ => self.todo += 1,
++        }
++        self.rows.push(json!({
++            "scope":scope, "number":number, "name":point.name, "status":point.status,
++            "reason":point.reason, "diagnostic":diag, "subtest":child,
++        }));
++    }
++
++    fn suite(&mut self, scope: &mut Vec<&'a str>) -> Result<(), String> {
++        let depth = scope.len();
++        let mut seen = 0;
++        let mut plan = None;
++        let mut child = None;
++        let mut trailing_plan = false;
++        while let Some(raw) = self.lines.get(self.pos).copied() {
++            if raw.trim().is_empty() {
++                self.pos += 1;
++                continue;
++            }
++            let indent = raw.len() - raw.trim_start_matches(' ').len();
++            if indent < depth * 4 {
++                break;
++            }
++            let n = self.pos + 1;
++            if indent != depth * 4 {
++                return Err(error(n, "unexpected indentation"));
++            }
++            self.pos += 1;
++            let line = &raw[indent..];
++            if line == "TAP version 13" && depth == 0 && n == 1 {
++                continue;
++            }
++            if line.starts_with("Bail out!") {
++                return Err(error(n, "bailout"));
++            }
++            if let Some(name) = line.strip_prefix("# Subtest: ") {
++                if name.is_empty() || child.is_some() || trailing_plan || depth >= 64 {
++                    return Err(error(n, "invalid subtest"));
++                }
++                scope.push(name);
++                self.suite(scope)?;
++                scope.pop();
++                child = Some(name);
++                continue;
++            }
++            if line.starts_with('#') {
++                continue;
++            }
++            if let Some(tail) = line.strip_prefix("1..") {
++                let (end, dir) = directive(tail);
++                let size = count(end).ok_or_else(|| error(n, "invalid plan"))?;
++                if plan.is_some()
++                    || child.is_some()
++                    || dir.is_some_and(|(k, _)| k != "skip" || size != 0)
++                {
++                    return Err(error(n, "unexpected plan"));
++                }
++                plan = Some(size);
++                trailing_plan = seen > 0;
++                continue;
++            }
++            if trailing_plan {
++                return Err(error(n, "point after trailing plan"));
++            }
++            let item =
++                point(line, seen + 1).ok_or_else(|| error(n, "invalid test point or numbering"))?;
++            if child.is_some_and(|name| name != item.name) {
++                return Err(error(n, "subtest result name mismatch"));
++            }
++            seen += 1;
++            let diag = self.diagnostic(depth)?;
++            self.record(item, scope, seen, diag, child.take().is_some());
++        }
++        if child.is_some() || plan != Some(seen) {
++            return Err(error(self.pos + 1, "missing result or plan mismatch"));
++        }
++        Ok(())
++    }
++}
++
++pub(super) fn parse(src: &str) -> Result<Report, String> {
++    let mut reader = Reader {
++        lines: src.lines().collect(),
++        ..Reader::default()
++    };
++    reader.suite(&mut Vec::new())?;
++    Ok(Report {
++        summary: json!({"pass":reader.passed,"fail":reader.failed,"skip":reader.skipped,"todo":reader.todo}),
++        rows: reader.rows,
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn tap_nested_numbers_restart() {
++        let report =
++            parse("ok 1 first\n# Subtest: child\n    ok 1 inner\n    1..1\nok 2 child\n1..2")
++                .unwrap();
++        assert_eq!(report.rows[1]["scope"], json!(["child"]));
++        assert_eq!(report.rows[2]["number"], 2);
++        assert_eq!(report.summary["pass"], 3);
++    }
++
++    #[test]
++    fn tap_diagnostic_is_opaque() {
++        let report = parse("not ok - issue\n  ---\n  1..900\n  ...\n1..1").unwrap();
++        assert_eq!(report.rows[0]["diagnostic"], json!(["1..900"]));
++    }
++}
+diff --git a/src/tools/report/tap/point.rs b/src/tools/report/tap/point.rs
+new file mode 100644
+index 0000000..3591fb7
+--- /dev/null
++++ b/src/tools/report/tap/point.rs
+@@ -0,0 +1,60 @@
++pub(super) fn count(raw: &str) -> Option<usize> {
++    if raw.is_empty() || !raw.bytes().all(|c| c.is_ascii_digit()) {
++        return None;
++    }
++    raw.parse().ok()
++}
++
++pub(super) fn directive(label: &str) -> (&str, Option<(&str, &str)>) {
++    for (offset, _) in label.match_indices('#') {
++        if offset > 0 && !label[..offset].ends_with(' ') {
++            continue;
++        }
++        let tail = label[offset + 1..].trim();
++        let (word, reason) = tail.split_once(' ').unwrap_or((tail, ""));
++        for kind in ["skip", "todo"] {
++            if word.eq_ignore_ascii_case(kind) {
++                return (label[..offset].trim_end(), Some((kind, reason.trim())));
++            }
++        }
++    }
++    (label.trim_end(), None)
++}
++
++pub(super) struct Point<'a> {
++    pub(super) name: &'a str,
++    pub(super) status: &'static str,
++    pub(super) reason: &'a str,
++}
++
++pub(super) fn point(line: &str, next: usize) -> Option<Point<'_>> {
++    let (passed, rest) = if let Some(rest) = line.strip_prefix("not ok") {
++        (false, rest)
++    } else {
++        (true, line.strip_prefix("ok")?)
++    };
++    if !rest.is_empty() && !rest.starts_with(' ') {
++        return None;
++    }
++    let mut label = rest.trim();
++    let first = label.split(' ').next().unwrap_or("");
++    if !first.is_empty() && first.bytes().all(|c| c.is_ascii_digit()) {
++        if count(first)? != next {
++            return None;
++        }
++        label = label[first.len()..].trim_start();
++    }
++    label = label.strip_prefix("- ").unwrap_or(label);
++    let (name, dir) = directive(label);
++    let (status, reason) = match dir {
++        Some(("skip", reason)) => ("skip", reason),
++        Some((_, reason)) => ("todo", reason),
++        None if passed => ("pass", ""),
++        None => ("fail", ""),
++    };
++    Some(Point {
++        status,
++        reason,
++        name,
++    })
++}
+diff --git a/tests/report_diff.rs b/tests/report_diff.rs
+new file mode 100644
+index 0000000..c5bca12
+--- /dev/null
++++ b/tests/report_diff.rs
+@@ -0,0 +1,42 @@
++mod report_support;
++use report_support::replay;
++
++#[test]
++fn diff_mailbox() {
++    replay("diff", "mailbox");
++}
++
++#[test]
++fn diff_mailbox_line() {
++    replay("diff", "mailbox_line");
++}
++
++#[test]
++fn diff_transfer() {
++    replay("diff", "transfer");
++}
++
++#[test]
++fn diff_blank_context() {
++    replay("diff", "blank_context");
++}
++
++#[test]
++fn diff_overlap() {
++    replay("diff", "overlap");
++}
++
++#[test]
++fn diff_new_overlap() {
++    replay("diff", "new_overlap");
++}
++
++#[test]
++fn diff_adjacent() {
++    replay("diff", "adjacent");
++}
++
++#[test]
++fn diff_legacy() {
++    replay("diff", "legacy");
++}
+diff --git a/tests/report_lcov.rs b/tests/report_lcov.rs
+new file mode 100644
+index 0000000..4aae53c
+--- /dev/null
++++ b/tests/report_lcov.rs
+@@ -0,0 +1,47 @@
++mod report_support;
++use report_support::replay;
++
++#[test]
++fn lcov_runners() {
++    replay("lcov", "runners");
++}
++
++#[test]
++fn lcov_ranges() {
++    replay("lcov", "ranges");
++}
++
++#[test]
++fn lcov_conflict() {
++    replay("lcov", "conflict");
++}
++
++#[test]
++fn lcov_backwards() {
++    replay("lcov", "backwards");
++}
++
++#[test]
++fn lcov_aliases() {
++    replay("lcov", "aliases");
++}
++
++#[test]
++fn lcov_alias_scope() {
++    replay("lcov", "alias_scope");
++}
++
++#[test]
++fn lcov_retry() {
++    replay("lcov", "retry");
++}
++
++#[test]
++fn lcov_legacy() {
++    replay("lcov", "legacy");
++}
++
++#[test]
++fn lcov_named_run() {
++    replay("lcov", "named_run");
++}
+diff --git a/tests/report_support/mod.rs b/tests/report_support/mod.rs
+new file mode 100644
+index 0000000..d3909e9
+--- /dev/null
++++ b/tests/report_support/mod.rs
+@@ -0,0 +1,38 @@
++use serde_json::{Value, json};
++use std::path::Path;
++use std::process::Command;
++
++pub fn replay(format: &str, case: &str) {
++    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
++        .join("fixtures/reports")
++        .join(format);
++    let input = root.join(format!("{case}.{format}"));
++    let expected = std::fs::read_to_string(root.join(format!("{case}.checks.json"))).unwrap();
++    let checks: Value = serde_json::from_str(&expected).unwrap();
++    let args = json!({"format":format,"path":input});
++    let output = Command::new(env!("CARGO_BIN_EXE_agy-rs"))
++        .args(["cli", "inspect", "--json", &args.to_string()])
++        .output()
++        .unwrap();
++    let text = String::from_utf8(output.stdout).unwrap();
++    if let Some(line) = checks.get("errorLine") {
++        assert!(
++            !output.status.success(),
++            "{case} expected rejection: {text}"
++        );
++        assert!(
++            text.contains(&format!("{format} line {line}:")),
++            "{case}: {text}"
++        );
++        return;
++    }
++    assert!(output.status.success(), "{case}: {text}");
++    let report: Value = serde_json::from_str(&text).unwrap();
++    for (pointer, want) in checks.as_object().unwrap() {
++        assert_eq!(
++            report.pointer(pointer),
++            Some(want),
++            "{case} {pointer}: {text}"
++        );
++    }
++}
+diff --git a/tests/report_tap.rs b/tests/report_tap.rs
+new file mode 100644
+index 0000000..387129e
+--- /dev/null
++++ b/tests/report_tap.rs
+@@ -0,0 +1,42 @@
++mod report_support;
++use report_support::replay;
++
++#[test]
++fn tap_lanes() {
++    replay("tap", "lanes");
++}
++
++#[test]
++fn tap_lane_error() {
++    replay("tap", "lane_error");
++}
++
++#[test]
++fn tap_escapes() {
++    replay("tap", "escapes");
++}
++
++#[test]
++fn tap_escaped_scope() {
++    replay("tap", "escaped_scope");
++}
++
++#[test]
++fn tap_block() {
++    replay("tap", "block");
++}
++
++#[test]
++fn tap_unclosed() {
++    replay("tap", "unclosed");
++}
++
++#[test]
++fn tap_attachment() {
++    replay("tap", "attachment");
++}
++
++#[test]
++fn tap_legacy() {
++    replay("tap", "legacy");
++}

@@ -1,0 +1,632 @@
+diff --git a/src/cli.rs b/src/cli.rs
+index 8079433..af117ba 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -16,6 +16,7 @@ const HELP: &str = r#"agy-rs cli <tool> [--cwd DIR] [--max-chars N] [--json '{..
+   check    [--compact|--full] [--concurrency N] [--timeout S] "CMD"...
+   filter   "CMD"   compress CMD's output read from stdin (runs nothing); first line [agy-rs PASS|FAIL],
+                    exit 1 when the output shows failure (used by `agy-rs hook pre-bash`)
++  inspect  --format diff|lcov|tap --report PATH [--max-chars N]
+   snapshot
+   worker-brief   print the /swarm worker brief with this binary's path filled in; set --cwd <WORKSPACE> before pasting
+ --json / --stdin take the tool's full MCP argument object; flags given after them override it."#;
+@@ -60,6 +61,8 @@ fn build(tool: &str, args: &[String]) -> Result<Value, String> {
+                 std::io::stdin().read_to_string(&mut text).map_err(|e| format!("Error: reading stdin: {e}"))?;
+                 top.extend(object(&text)?);
+             }
++            "--format" if tool == "inspect_report" => drop(top.insert("format".into(), value()?.into())),
++            "--report" if tool == "inspect_report" => drop(top.insert("path".into(), value()?.into())),
+             "--cwd" => drop(top.insert("cwd".into(), value()?.into())),
+             "--max-chars" => drop(top.insert("maxChars".into(), number(value()?)?.into())),
+             "--concurrency" => drop(top.insert("concurrency".into(), number(value()?)?.into())),
+diff --git a/src/mcp/mod.rs b/src/mcp/mod.rs
+index 14275c2..a482f5e 100644
+--- a/src/mcp/mod.rs
++++ b/src/mcp/mod.rs
+@@ -71,7 +71,7 @@ mod tests {
+         assert!(handle(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).is_none());
+         let list = handle(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).unwrap();
+         let names: Vec<&str> = list["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+-        assert_eq!(names, ["batch_search", "quick_outline", "apply_edits", "run_checks"]);
++        assert_eq!(names, ["batch_search", "quick_outline", "apply_edits", "run_checks", "inspect_report"]);
+         // read_slices is unlisted but still answers a host that calls it.
+         let slices = handle(&json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "read_slices", "arguments": {"lineRanges": ["Cargo.toml:1-2"]}}})).unwrap();
+         assert_eq!(slices["result"]["isError"], false, "{slices}");
+diff --git a/src/mcp/schema.rs b/src/mcp/schema.rs
+index c54bd47..e562758 100644
+--- a/src/mcp/schema.rs
++++ b/src/mcp/schema.rs
+@@ -93,5 +93,15 @@ pub fn tools() -> Value {
+                 "maxChars": max_chars
+             }),
+         ),
++        tool(
++            "inspect_report",
++            "Inspect a saved development report and return a bounded JSON summary.",
++            &["format", "path"],
++            json!({
++                "format": {"type":"string","enum":["diff","lcov","tap"]},
++                "path": {"type":"string"},
++                "maxChars": max_chars
++            }),
++        ),
+     ])
+ }
+diff --git a/src/tools/report/diff/header.rs b/src/tools/report/diff/header.rs
+index 78cb6ab..217349c 100644
+--- a/src/tools/report/diff/header.rs
++++ b/src/tools/report/diff/header.rs
+@@ -32,3 +32,15 @@ pub(super) fn header(raw: &str) -> Option<(Range, Range, &str)> {
+     };
+     Some((range(left, '-')?, range(right, '+')?, heading))
+ }
++
++impl Range {
++    // Convert the unified range to zero-based boundary coordinates.
++    pub(super) fn boundaries(self) -> (u64, u64) {
++        let begin = if self.count == 0 {
++            self.start
++        } else {
++            self.start - 1
++        };
++        (begin, begin + self.count)
++    }
++}
+diff --git a/src/tools/report/diff/mod.rs b/src/tools/report/diff/mod.rs
+index 1dd8c46..eaf5045 100644
+--- a/src/tools/report/diff/mod.rs
++++ b/src/tools/report/diff/mod.rs
+@@ -26,26 +26,66 @@ struct Hunk<'a> {
+     heading: &'a str,
+ }
+ 
++fn envelope(line: &str) -> bool {
++    line.strip_prefix("From ")
++        .and_then(|s| s.strip_suffix(" Mon Sep 17 00:00:00 2001"))
++        .is_some_and(|hash| hash.len() == 40 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
++}
++
+ pub(super) fn parse(src: &str) -> Result<Report, String> {
+-    // A mailed patch begins with an envelope and a human-readable cover letter.
+-    let mut lines: Vec<_> = src.lines().collect();
+-    if lines.first().is_some_and(|line| line.starts_with("From "))
+-        && let Some(start) = lines
+-            .iter()
+-            .position(|line| line.starts_with("diff --git "))
+-    {
+-        lines.drain(..start);
+-    }
++    let lines: Vec<_> = src.lines().collect();
+     let mut pos = 0;
+     let mut totals = Totals::default();
+     let mut rows = Vec::new();
++    let mut mail = false;
+     while pos < lines.len() {
+         let line = lines[pos];
++        if envelope(line) {
++            mail = true;
++            pos += 1;
++            while pos < lines.len()
++                && !lines[pos].starts_with("diff --git ")
++                && !envelope(lines[pos])
++            {
++                pos += 1;
++            }
++            continue;
++        }
++        if mail && line == "-- " {
++            pos += 1;
++            while pos < lines.len() && !envelope(lines[pos]) {
++                pos += 1;
++            }
++            continue;
++        }
++        if let Some((kind, from)) = line
++            .strip_prefix("rename from ")
++            .map(|v| ("rename", v))
++            .or_else(|| line.strip_prefix("copy from ").map(|v| ("copy", v)))
++        {
++            let old = path(from, "", pos + 1)?;
++            pos += 1;
++            let to = lines
++                .get(pos)
++                .and_then(|s| s.strip_prefix(kind))
++                .and_then(|s| s.strip_prefix(" to "))
++                .ok_or_else(|| error(pos + 1, "missing destination"))?;
++            let new = path(to, "", pos + 1)?;
++            rows.push(json!({"kind":kind,"old":old,"new":new}));
++            pos += 1;
++            // An edited transfer has normal content headers after optional index metadata.
++            let next = lines[pos..].iter().find(|s| !s.starts_with("index "));
++            if !next.is_some_and(|s| s.starts_with("--- ")) {
++                totals.files += 1;
++            }
++            continue;
++        }
+         if line.is_empty()
+             || [
+                 "diff --git ",
+                 "index ",
+                 "new file mode ",
++                "similarity index ",
+                 "deleted file mode ",
+             ]
+             .iter()
+@@ -72,10 +112,17 @@ pub(super) fn parse(src: &str) -> Result<Report, String> {
+         pos += 1;
+         totals.files += 1;
+         let mut id = 0;
++        let mut limit = (0, 0);
+         while let Some(line) = lines.get(pos).filter(|s| s.starts_with("@@")) {
+             let (left, right, heading) =
+                 header(line).ok_or_else(|| error(pos + 1, "invalid hunk header"))?;
+             pos += 1;
++            let (old_begin, old_end) = left.boundaries();
++            let (new_begin, new_end) = right.boundaries();
++            if old_begin < limit.0 || new_begin < limit.1 {
++                return Err(error(pos, "hunks overlap or regress"));
++            }
++            limit = (old_end, new_end);
+             id += 1;
+             totals.hunks += 1;
+             body(
+@@ -122,4 +169,18 @@ mod tests {
+         );
+         assert!(path(r#""a/\377""#, "a/", 1).is_err());
+     }
++
++    #[test]
++    fn diff_archive_regression() {
++        let out =
++            parse("diff --git a/a b/b\nsimilarity index 100%\ncopy from a\ncopy to λ").unwrap();
++        assert_eq!(out.rows[0]["new"], "λ");
++        assert_eq!(out.summary["files"], 1);
++    }
++    #[test]
++    fn diff_boundary_regression() {
++        let input = "--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n+first\n@@ -1 +2 @@\n old";
++        assert!(parse(input).is_ok());
++        assert!(parse(&input.replace("-1 +2", "-1 +1")).is_err());
++    }
+ }
+diff --git a/src/tools/report/diff/regions.rs b/src/tools/report/diff/regions.rs
+index 8bc8a30..f4bc02b 100644
+--- a/src/tools/report/diff/regions.rs
++++ b/src/tools/report/diff/regions.rs
+@@ -45,7 +45,7 @@ pub(super) fn body(
+             break;
+         }
+         let n = *pos + 1;
+-        let op = line.and_then(|s| s.as_bytes().first()).copied();
++        let op = line.map(|s| s.as_bytes().first().copied().unwrap_or(b' '));
+         if edit.added == 0 && edit.removed == 0 {
+             edit.old_at = old.start + left;
+             edit.new_at = new.start + right;
+diff --git a/src/tools/report/lcov/mod.rs b/src/tools/report/lcov/mod.rs
+index ab6c5c2..717445f 100644
+--- a/src/tools/report/lcov/mod.rs
++++ b/src/tools/report/lcov/mod.rs
+@@ -27,6 +27,7 @@ struct Reader {
+     files: BTreeMap<String, Source>,
+     current: Option<String>,
+     records: usize,
++    groups: BTreeMap<u64, (u64, Option<u64>)>,
+ }
+ 
+ impl Reader {
+@@ -36,6 +37,7 @@ impl Reader {
+         }
+         if line == "end_of_record" {
+             self.current.take().ok_or("unmatched end_of_record")?;
++            self.groups.clear();
+             self.records += 1;
+             return Ok(());
+         }
+@@ -52,6 +54,31 @@ impl Reader {
+         let path = self.current.as_ref().ok_or("field outside source record")?;
+         let source = self.files.get_mut(path).expect("registered on SF");
+         match tag {
++            "FNL" => {
++                let (id, range) = raw.split_once(',').ok_or("missing location")?;
++                let (begin, end) = range
++                    .split_once(',')
++                    .map_or((range, None), |(a, b)| (a, Some(b)));
++                let begin = coordinate(begin)?;
++                let end = end.map(coordinate).transpose()?;
++                if end.is_some_and(|n| n < begin) {
++                    return Err("invalid extent");
++                }
++                let id = integer(id)?;
++                if self.groups.insert(id, (begin, end)).is_some() {
++                    return Err("duplicate function group");
++                }
++                Ok(())
++            }
++            "FNA" => {
++                let mut fields = raw.splitn(3, ',');
++                let id = integer(fields.next().unwrap_or(""))?;
++                let count = fields.next().ok_or("missing count")?;
++                let name = fields.next().ok_or("missing name")?;
++                let &(begin, end) = self.groups.get(&id).ok_or("unknown function group")?;
++                source.declare(name, begin, end)?;
++                source.observe(name, integer(count)?)
++            }
+             "DA" => source.add_line(raw),
+             "FN" | "FNDA" => source.function(raw, tag == "FN"),
+             "BRDA" => source.branch(raw),
+@@ -61,11 +88,39 @@ impl Reader {
+     }
+ }
+ 
++fn superseded(lines: &[&str]) -> Vec<bool> {
++    let mut omitted = vec![false; lines.len()];
++    let mut snapshots = BTreeMap::new();
++    let mut test = "";
++    let mut pending = None;
++    for (i, &line) in lines.iter().enumerate() {
++        if let Some(name) = line.strip_prefix("TN:") {
++            test = name;
++        }
++        if let Some(path) = line.strip_prefix("SF:") {
++            pending = filename(path).ok().map(|path| (i, (test, path)));
++        }
++        if line == "end_of_record"
++            && let Some((begin, key)) = pending.take()
++            && !key.0.is_empty()
++            && let Some(old) = snapshots.insert(key, begin..=i)
++        {
++            omitted[old].fill(true);
++        }
++    }
++    omitted
++}
++
+ pub(super) fn parse(src: &str) -> Result<Report, String> {
+     let mut reader = Reader::default();
+     let mut last = 0;
+-    for (index, line) in src.lines().enumerate() {
++    let lines: Vec<_> = src.lines().collect();
++    let omitted = superseded(&lines);
++    for (index, line) in lines.iter().enumerate() {
+         last = index + 1;
++        if omitted[index] {
++            continue;
++        }
+         reader
+             .line(line)
+             .map_err(|e| format!("lcov line {last}: {e}"))?;
+@@ -103,4 +158,18 @@ mod tests {
+         assert_eq!(report.rows[0]["taken"], 0);
+         assert_eq!(report.rows[0]["branches"], 1);
+     }
++
++    #[test]
++    fn lcov_archive_regression() {
++        let report =
++            parse("TN:x\nSF:f\nFN:1,old\nend_of_record\nSF:f\nDA:1,2\nend_of_record").unwrap();
++        assert_eq!(report.rows[0]["functions"], 0);
++        assert_eq!(report.summary["records"], 1);
++    }
++    #[test]
++    fn lcov_boundary_regression() {
++        let input = "SF:f\nFN:3,3,identity\nFNDA:1,identity\nend_of_record";
++        assert_eq!(parse(input).unwrap().rows[0]["functions"], 1);
++        assert!(parse(&input.replace("3,3", "3,2")).is_err());
++    }
+ }
+diff --git a/src/tools/report/lcov/paths.rs b/src/tools/report/lcov/paths.rs
+index 3e52ba3..ee4d15a 100644
+--- a/src/tools/report/lcov/paths.rs
++++ b/src/tools/report/lcov/paths.rs
+@@ -1,11 +1,35 @@
+ use super::Parsed;
+ pub(super) fn filename(raw: &str) -> Parsed<String> {
+-    // Coverage exporters on Windows may use either separator.
+-    let slashes = raw.replace('\\', "/");
+-    let raw = slashes.as_str();
+-    let absolute = raw.starts_with('/');
++    let windows = raw.as_bytes().get(1) == Some(&b':')
++        && raw.as_bytes()[0].is_ascii_alphabetic()
++        && raw
++            .as_bytes()
++            .get(2)
++            .is_some_and(|c| matches!(c, b'/' | b'\\'));
++    let unc = raw.starts_with("\\\\") || raw.starts_with("//");
++    let canonical = if windows || unc {
++        raw.replace('\\', "/")
++    } else {
++        raw.to_string()
++    };
++    let mut prefix = String::new();
++    let mut body = canonical.as_str();
++    if windows {
++        prefix = canonical[..2].to_ascii_uppercase();
++        body = &canonical[2..];
++    } else if unc {
++        let mut parts = canonical.trim_start_matches('/').splitn(3, '/');
++        let server = parts.next().unwrap_or("");
++        let share = parts
++            .next()
++            .filter(|s| !s.is_empty())
++            .ok_or("invalid UNC root")?;
++        prefix = format!("//{server}/{share}");
++        body = parts.next().unwrap_or("");
++    }
++    let absolute = windows || unc || raw.starts_with('/');
+     let mut parts = Vec::new();
+-    for component in raw.split('/') {
++    for component in body.split('/') {
+         match component {
+             "" | "." => {}
+             ".." if parts.last().is_some_and(|p| *p != "..") => {
+@@ -19,7 +43,7 @@ pub(super) fn filename(raw: &str) -> Parsed<String> {
+         return Err("empty source path");
+     }
+     Ok(format!(
+-        "{}{}",
++        "{prefix}{}{}",
+         if absolute { "/" } else { "" },
+         parts.join("/")
+     ))
+diff --git a/src/tools/report/lcov/source.rs b/src/tools/report/lcov/source.rs
+index 277e5b0..12c4c87 100644
+--- a/src/tools/report/lcov/source.rs
++++ b/src/tools/report/lcov/source.rs
+@@ -8,6 +8,7 @@ struct Line {
+ #[derive(Default)]
+ struct Function {
+     declaration: Option<u64>,
++    end: Option<u64>,
+     hits: u64,
+ }
+ 
+@@ -43,16 +44,49 @@ impl Source {
+         if name.is_empty() {
+             return Err("empty function name");
+         }
+-        let function = self.functions.entry(name.to_owned()).or_default();
+-        if declaration {
+-            let line = coordinate(value)?;
+-            if function.declaration.is_some_and(|old| old != line) {
+-                return Err("conflicting function declaration");
++        let (end, name) = if declaration {
++            if let Some((field, tail)) = name.split_once(',')
++                && !field.is_empty()
++                && field.bytes().all(|b| b.is_ascii_digit())
++            {
++                (Some(coordinate(field)?), tail)
++            } else {
++                (None, name)
+             }
+-            function.declaration = Some(line);
+         } else {
+-            function.hits = function.hits.saturating_add(integer(value)?);
++            (None, name)
++        };
++        if declaration {
++            self.declare(name, coordinate(value)?, end)
++        } else {
++            self.observe(name, integer(value)?)
++        }
++    }
++
++    pub(super) fn declare(&mut self, name: &str, line: u64, end: Option<u64>) -> Parsed<()> {
++        if name.is_empty() {
++            return Err("empty function name");
+         }
++        let function = self.functions.entry(name.to_owned()).or_default();
++        if function.declaration.is_some_and(|old| old != line) {
++            return Err("conflicting function declaration");
++        }
++        if let Some(end) = end {
++            if end < line || function.end.is_some_and(|old| old != end) {
++                return Err("conflicting function extent");
++            }
++            function.end = Some(end);
++        }
++        function.declaration = Some(line);
++        Ok(())
++    }
++
++    pub(super) fn observe(&mut self, name: &str, hits: u64) -> Parsed<()> {
++        if name.is_empty() {
++            return Err("empty function name");
++        }
++        let function = self.functions.entry(name.to_owned()).or_default();
++        function.hits = function.hits.saturating_add(hits);
+         Ok(())
+     }
+ 
+diff --git a/src/tools/report/tap/diagnostic.rs b/src/tools/report/tap/diagnostic.rs
+index 328851e..9f48ef8 100644
+--- a/src/tools/report/tap/diagnostic.rs
++++ b/src/tools/report/tap/diagnostic.rs
+@@ -1,7 +1,13 @@
+ use super::*;
+ impl<'a> Reader<'a> {
+     pub(super) fn diagnostic(&mut self, depth: usize) -> Result<Vec<&'a str>, String> {
+-        let indent = depth * 4 + 2;
++        let Some(open) = self.lines.get(self.pos).and_then(|s| s.strip_suffix("---")) else {
++            return Ok(Vec::new());
++        };
++        let indent = open.len();
++        if !open.bytes().all(|b| b == b' ') || ![depth * 4 + 2, depth * 4 + 4].contains(&indent) {
++            return Ok(Vec::new());
++        }
+         let mut data = Vec::new();
+         let deindent = |line: &'a str| {
+             line.get(..indent)
+@@ -13,6 +19,11 @@ impl<'a> Reader<'a> {
+         }
+         self.pos += 1;
+         while let Some(line) = self.lines.get(self.pos) {
++            if line.is_empty() {
++                self.pos += 1;
++                data.push("");
++                continue;
++            }
+             let body =
+                 deindent(line).ok_or_else(|| error(self.pos + 1, "diagnostic indentation"))?;
+             self.pos += 1;
+diff --git a/src/tools/report/tap/mod.rs b/src/tools/report/tap/mod.rs
+index afedc21..f4369f1 100644
+--- a/src/tools/report/tap/mod.rs
++++ b/src/tools/report/tap/mod.rs
+@@ -35,7 +35,7 @@ impl<'a> Reader<'a> {
+             _ => self.todo += 1,
+         }
+         self.rows.push(json!({
+-            "scope":scope, "number":number, "name":point.name, "status":point.status,
++            "scope":scope.iter().map(|s| point::display_name(s)).collect::<Vec<_>>(), "number":number, "name":point::display_name(point.name), "status":point.status,
+             "reason":point.reason, "diagnostic":diag, "subtest":child,
+         }));
+     }
+@@ -96,6 +96,25 @@ impl<'a> Reader<'a> {
+             if trailing_plan {
+                 return Err(error(n, "point after trailing plan"));
+             }
++            if let Some(head) = line.strip_suffix(" {") {
++                if child.is_some() || depth >= 64 {
++                    return Err(error(n, "unexpected buffered result"));
++                }
++                let item =
++                    point(head, seen + 1).ok_or_else(|| error(n, "invalid buffered parent"))?;
++                scope.push(item.name);
++                self.suite(scope)?;
++                scope.pop();
++                let close = self.lines.get(self.pos).copied().unwrap_or("");
++                if close.strip_suffix('}') != Some(&raw[..indent]) {
++                    return Err(error(self.pos + 1, "unclosed buffered result"));
++                }
++                self.pos += 1;
++                seen += 1;
++                let diag = self.diagnostic(depth)?;
++                self.record(item, scope, seen, diag, true);
++                continue;
++            }
+             let item =
+                 point(line, seen + 1).ok_or_else(|| error(n, "invalid test point or numbering"))?;
+             if child.is_some_and(|name| name != item.name) {
+@@ -112,9 +131,9 @@ impl<'a> Reader<'a> {
+     }
+ }
+ 
+-pub(super) fn parse(src: &str) -> Result<Report, String> {
++fn session(lines: Vec<&str>) -> Result<Report, String> {
+     let mut reader = Reader {
+-        lines: src.lines().collect(),
++        lines,
+         ..Reader::default()
+     };
+     reader.suite(&mut Vec::new())?;
+@@ -124,6 +143,56 @@ pub(super) fn parse(src: &str) -> Result<Report, String> {
+     })
+ }
+ 
++fn tagged(line: &str) -> Option<(&str, &str)> {
++    let (lane, body) = line.strip_prefix('[')?.split_once("] ")?;
++    (!lane.is_empty()).then_some((lane, body))
++}
++
++pub(super) fn parse(src: &str) -> Result<Report, String> {
++    let lines: Vec<_> = src.lines().collect();
++    if !lines.first().is_some_and(|s| tagged(s).is_some()) {
++        return session(lines);
++    }
++    let mut lanes = Vec::new();
++    let mut streams = std::collections::BTreeMap::new();
++    for (i, line) in lines.iter().enumerate() {
++        let (lane, body) = tagged(line).ok_or_else(|| error(i + 1, "missing lane"))?;
++        let stream = streams.entry(lane).or_insert_with(|| {
++            lanes.push(lane);
++            Vec::new()
++        });
++        stream.push((i + 1, body));
++    }
++    let mut result = Report {
++        rows: Vec::new(),
++        summary: json!({"pass":0,"fail":0,"skip":0,"todo":0}),
++    };
++    for lane in lanes {
++        let records = &streams[lane];
++        let report = session(records.iter().map(|(_, s)| *s).collect()).map_err(|message| {
++            // Session diagnostics use one-based positions within this lane.
++            let Some((pos, why)) = message
++                .strip_prefix("tap line ")
++                .and_then(|s| s.split_once(": "))
++            else {
++                return message;
++            };
++            let index = pos.parse::<usize>().expect("session line number");
++            error(records.get(index - 1).map_or(lines.len() + 1, |r| r.0), why)
++        })?;
++        for mut row in report.rows {
++            row["lane"] = json!(lane);
++            result.rows.push(row);
++        }
++        for key in ["pass", "fail", "skip", "todo"] {
++            result.summary[key] = json!(
++                result.summary[key].as_u64().unwrap() + report.summary[key].as_u64().unwrap()
++            );
++        }
++    }
++    Ok(result)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -143,4 +212,17 @@ mod tests {
+         let report = parse("not ok - issue\n  ---\n  1..900\n  ...\n1..1").unwrap();
+         assert_eq!(report.rows[0]["diagnostic"], json!(["1..900"]));
+     }
++
++    #[test]
++    fn tap_archive_regression() {
++        let r = parse("[b] ok hot\n[a] 1..0\n[b] 1..1").unwrap();
++        assert_eq!(r.rows.len(), 1);
++        assert_eq!(r.rows[0]["lane"], "b");
++    }
++    #[test]
++    fn tap_boundary_regression() {
++        let r = parse("ok skip {\n    1..0\n}\n1..1").unwrap();
++        assert_eq!(r.rows[0]["subtest"], true);
++        assert!(parse("ok skip {\n    1..0").is_err());
++    }
+ }
+diff --git a/src/tools/report/tap/point.rs b/src/tools/report/tap/point.rs
+index 3591fb7..34a3361 100644
+--- a/src/tools/report/tap/point.rs
++++ b/src/tools/report/tap/point.rs
+@@ -58,3 +58,16 @@ pub(super) fn point(line: &str, next: usize) -> Option<Point<'_>> {
+         name,
+     })
+ }
++
++pub(super) fn display_name(label: &str) -> String {
++    let mut text = String::new();
++    let mut chars = label.chars().peekable();
++    while let Some(ch) = chars.next() {
++        if ch == '\\' && chars.peek().is_some_and(|next| matches!(next, '#' | '\\')) {
++            text.push(chars.next().unwrap());
++        } else {
++            text.push(ch);
++        }
++    }
++    text
++}
+diff --git a/tests/mcp_stdio.rs b/tests/mcp_stdio.rs
+index f55e8f9..ee084f3 100644
+--- a/tests/mcp_stdio.rs
++++ b/tests/mcp_stdio.rs
+@@ -34,8 +34,8 @@ fn mcp_session_over_stdio() {
+     assert_eq!(ids, [json!(1), json!(2), json!(3)], "the notification must get no reply");
+     assert!(replies[0]["result"]["capabilities"]["tools"].is_object());
+     let tools = replies[1]["result"]["tools"].as_array().unwrap();
+-    assert_eq!(tools.len(), 4);
+-    for name in ["batch_search", "quick_outline", "apply_edits", "run_checks"] {
++    assert_eq!(tools.len(), 5);
++    for name in ["batch_search", "quick_outline", "apply_edits", "run_checks", "inspect_report"] {
+         assert!(tools.iter().any(|t| t["name"] == name), "missing {name}");
+     }
+     // toolSummary must not make the call a protocol error.

@@ -1,0 +1,7 @@
+Repair the saved-report importers so the patch viewer, coverage dashboard, and test inspector can read the customer archives again. Each importer under src/tools/report has its own implementation, tests, and matching attachments under fixtures/reports. Reproduce the incidents against the existing binary, preserve working formats, and add regressions following the archive's contribution notes. Keep the recorded inputs and client expectations intact.
+
+Finish the release by publishing the inspector as shown in the client transcript. Preserve the dependency set and make these commands pass:
+
+cargo build --offline --locked --all-targets
+cargo clippy --offline --locked --all-targets -- -D warnings
+cargo test --offline --locked --all-targets
