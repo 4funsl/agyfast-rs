@@ -16,6 +16,10 @@ fn handle(msg: &Value) -> Option<Value> {
             json!({"jsonrpc": "2.0", "id": id.clone(), "error": {"code": -32600, "message": "invalid request"}})
         });
     };
+    // A tool call without an id could not be answered: do not run it for its side effects.
+    if method == "tools/call" && msg.get("id").is_none() {
+        return None;
+    }
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
     let result = match method {
         "initialize" => Ok(json!({
@@ -49,12 +53,13 @@ fn handle(msg: &Value) -> Option<Value> {
 
 pub fn serve() -> i32 {
     let mut out = std::io::stdout().lock();
-    for line in std::io::stdin().lock().lines() {
+    // Bytes, not `lines()`: a frame that is not UTF-8 gets a parse error instead of ending the server.
+    for line in std::io::stdin().lock().split(b'\n') {
         let Ok(line) = line else { break };
-        if line.trim().is_empty() {
+        if line.trim_ascii().is_empty() {
             continue;
         }
-        let reply = match serde_json::from_str::<Value>(&line) {
+        let reply = match serde_json::from_slice::<Value>(&line) {
             Ok(msg) => handle(&msg),
             Err(e) => Some(json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": format!("parse error: {e}")}})),
         };
@@ -90,5 +95,9 @@ mod tests {
         assert_eq!(handle(&json!({"jsonrpc": "2.0", "id": 1})).unwrap()["error"]["code"], -32600);
         assert_eq!(handle(&json!({"jsonrpc": "2.0", "id": 1, "method": 123})).unwrap()["error"]["code"], -32600);
         assert!(handle(&json!({"jsonrpc": "2.0"})).is_none());
+        // No id, no reply, so no side effects either: the file must not be created.
+        let f = std::env::temp_dir().join(format!("agyfast-rs-noid-{}", std::process::id()));
+        let call = json!({"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "apply_edits", "arguments": {"cwd": std::env::temp_dir(), "edits": [{"path": f, "create": "x"}]}}});
+        assert!(handle(&call).is_none() && !f.exists());
     }
 }

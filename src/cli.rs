@@ -202,13 +202,9 @@ pub fn run(args: &[String]) -> i32 {
             };
         }
         Some("filter") => {
-            let (command, framed) = match args {
-                [_, command] => (command, false),
-                [_, flag, command] if flag == "--framed" => (command, true),
-                _ => {
-                    eprintln!("{HELP}");
-                    return 2;
-                }
+            let [_, command] = args else {
+                eprintln!("{HELP}");
+                return 2;
             };
             let raw = match read_bounded(std::io::stdin().lock()) {
                 Ok(raw) => raw,
@@ -217,22 +213,9 @@ pub fn run(args: &[String]) -> i32 {
                     return 1;
                 }
             };
-            let (raw, status) = if framed {
-                let frame = raw.iter().rposition(|&b| b == 0).and_then(|i| {
-                    let code = std::str::from_utf8(&raw[i + 1..]).ok()?.parse::<u8>().ok()?;
-                    Some((&raw[..i], Some(code)))
-                });
-                let Some(frame) = frame else {
-                    eprintln!("Error: missing check exit status");
-                    return 1;
-                };
-                frame
-            } else {
-                (raw.as_slice(), None)
-            };
-            let (text, failed) = tools::check::filter(command, &String::from_utf8_lossy(raw), status);
+            let (text, failed) = tools::check::filter(command, &String::from_utf8_lossy(&raw));
             println!("{text}");
-            return i32::from(status.unwrap_or(u8::from(failed)));
+            return i32::from(failed);
         }
         Some("worker-brief") => {
             return match worker_brief() {

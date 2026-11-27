@@ -1,6 +1,6 @@
 [package]
 name = "agyfast-rs"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 description = "Fast batched code navigation, edits and checks for Antigravity and Claude Code"
 license = "MIT"

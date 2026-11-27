@@ -1,7 +1,7 @@
 {
   "name": "agyfast-rs",
   "displayName": "agyfast-rs",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Batched code search, outlines, atomic edits and compressed checks, plus a session snapshot, in one static binary.",
   "license": "MIT",
   "keywords": ["performance", "latency", "batch", "search", "edit", "mcp"],

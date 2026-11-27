@@ -12,6 +12,8 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 use wait_timeout::ChildExt;
 
@@ -19,6 +21,7 @@ const DEFAULT_TIMEOUT: u64 = 60;
 const MAX_TIMEOUT: u64 = 170; // the reference's per-call MCP budget
 const DEFAULT_CONCURRENCY: usize = 4;
 const READ_CAP: u64 = 16 << 20;
+const OUTPUT_CAP: u64 = 256 << 20; // a command writing more than this is killed
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -105,15 +108,20 @@ pub fn run(args: Value) -> Result<String, String> {
 
     let threads = a.concurrency.unwrap_or(DEFAULT_CONCURRENCY).clamp(1, 8).min(jobs.len());
     let start = Instant::now();
+    // One deadline for the whole call; queued commands get what is left of it.
+    let deadline = start + Duration::from_secs(jobs.iter().map(|j| j.3).max().unwrap_or(DEFAULT_TIMEOUT));
+    let exec = |(_, cmd, dir, t): &(String, &str, std::path::PathBuf, u64)| {
+        execute_within(cmd, dir, *t, deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(*t)))
+    };
     let runs: Vec<Run> = if threads == 1 {
-        jobs.iter().map(|(_, cmd, dir, t)| execute(cmd, dir, *t)).collect()
+        jobs.iter().map(exec).collect()
     } else {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
             .map_err(|e| format!("Error: cannot start worker threads: {e}"))?;
         // with_max_len(1): every command is its own stealable job, so a long one never queues others behind it.
-        pool.install(|| jobs.par_iter().with_max_len(1).map(|(_, cmd, dir, t)| execute(cmd, dir, *t)).collect())
+        pool.install(|| jobs.par_iter().with_max_len(1).map(exec).collect())
     };
 
     let passed = runs.iter().filter(|r| r.status == Status::Pass).count();
@@ -216,14 +224,22 @@ fn body(r: &Run, full: bool, max: usize) -> String {
 }
 
 fn execute(command: &str, dir: &Path, timeout: u64) -> Run {
-    match split_chain(command) {
-        Some(steps) => execute_chain(&steps, dir, timeout),
-        None => execute_one(command, dir, timeout, Duration::from_secs(timeout)),
-    }
+    execute_within(command, dir, timeout, Duration::from_secs(timeout))
 }
 
 /// `timeout` is the reported limit, `wait` what is left of it.
+fn execute_within(command: &str, dir: &Path, timeout: u64, wait: Duration) -> Run {
+    match split_chain(command) {
+        Some(steps) => execute_chain(&steps, dir, timeout, wait),
+        None => execute_one(command, dir, timeout, wait),
+    }
+}
+
+/// `timeout` is the reported limit, `wait` what is left of it; nothing left: timed out without starting.
 fn execute_one(command: &str, dir: &Path, timeout: u64, wait: Duration) -> Run {
+    if wait.is_zero() {
+        return Run { status: Status::Timeout, ms: 0, out: String::new(), kind: kind(command), injected: false, timeout, steps: Vec::new() };
+    }
     let json = inject_json(command);
     let start = Instant::now();
     let (status, out) = match spawn_and_wait(json.as_deref().unwrap_or(command), dir, wait) {
@@ -265,8 +281,9 @@ fn chain_steps(parts: Vec<&str>, win: bool) -> Option<Vec<Step<'_>>> {
             let prog = w.get(i)?.1;
             if eq(prog, "cd") {
                 let dir = w.get(1).filter(|_| i == 0 && w.len() == 2)?.1;
-                (!(dir.starts_with(['-', '~']) || dir.contains(['$', '*', '?']) || (win && dir.contains('%'))))
-                    .then(|| Step::Cd(dir.trim_matches(['\'', '"'])))
+                let bare = dir.trim_matches(['\'', '"']); // quotes left inside (`"my dir"/sub`): let the shell parse it
+                (!(dir.starts_with(['-', '~']) || dir.contains(['$', '*', '?']) || (win && dir.contains('%')) || bare.contains(['\'', '"'])))
+                    .then_some(Step::Cd(bare))
             } else if prog.contains(['\'', '"', '$', '%']) || STATEFUL.iter().any(|&s| eq(prog, s)) {
                 None
             } else {
@@ -369,7 +386,8 @@ fn rewrite(command: &str, exe: &str) -> Option<String> {
         .map(|&p| match filterable(p) {
             true => {
                 let p = p.strip_suffix("2>&1").map_or(p, str::trim_end);
-                format!(r#"{{ if {}; then printf '\0%s' 0; else printf '\0%s' "$?"; fi; }} 2>&1 | {exe} cli filter --framed {}"#, inject_json(p).as_deref().unwrap_or(p), sh_quote(p))
+                // The original command leads the pipeline, so the host's permission rules for it still match.
+                format!("{} 2>&1 | {exe} cli filter {}", inject_json(p).as_deref().unwrap_or(p), sh_quote(p))
             }
             false => p.to_string(),
         })
@@ -405,10 +423,10 @@ pub fn pre_bash_hook() {
 }
 
 /// `agyfast-rs cli filter`: compress `raw`, the captured output of `command`, under a
-/// status line. A hook supplies the child status; a manual pipeline uses output heuristics.
-pub fn filter(command: &str, raw: &str, status: Option<u8>) -> (String, bool) {
+/// status line; pass or fail is judged from the output.
+pub fn filter(command: &str, raw: &str) -> (String, bool) {
     let (k, out) = (kind(command), clean(raw));
-    let failed = status.map(|s| s != 0).or_else(|| failed(k, &out));
+    let failed = failed(k, &out);
     let text = match failed {
         None => format!("[agyfast-rs] {command} (status not judged)\n{}", generic(&out)),
         Some(false) => format!("[agyfast-rs PASS] {command}: {}", summary(&compress(k, &out, budget::CAP))),
@@ -426,13 +444,18 @@ fn failed(kind: Kind, out: &str) -> Option<bool> {
     let error_line = |l: &str| l.starts_with("error:") || l.starts_with("error[");
     let startup_err = |l: &str| {
         l.contains("command not found")
-            || l.contains(": not found")
+            || (l.contains("sh: ") && l.ends_with(": not found"))
             || l.contains("is not recognized as an internal or external command")
-            || l.starts_with("ERROR:")
+            || (l.starts_with("ERROR:") && l.contains("not found"))
             || (l.starts_with("go: ") && (l.contains("not found") || l.contains("cannot find")))
+            // argparse usage errors (`pytest: error: unrecognized arguments`); a bare program name only, not `file:12: error: ` log text
+            || l.split_once(": error: ").is_some_and(|(prog, _)| !prog.is_empty() && !prog.contains([' ', ':']))
+            || l.starts_with("ImportError while loading conftest")
+            || l.starts_with("Oops! Something went wrong") // eslint crash
+            || (l.contains("No tests found") && !l.contains("exiting with code 0")) // jest; `--passWithNoTests` exits 0
     };
     let passing_line = |l: &str| {
-        l.ends_with(" ... ok") || ["--- PASS", "=== RUN"].iter().any(|p| l.starts_with(p)) || l.starts_with(['✓', '✔', '√'])
+        l.ends_with(" ... ok") || l.ends_with(" PASSED") || ["--- PASS", "=== RUN"].iter().any(|p| l.starts_with(p)) || l.starts_with(['✓', '✔', '√'])
     };
     // `5 failed`, `1 error`, `2 errors`: a non-zero count of failures.
     let counted = |l: &str| {
@@ -458,25 +481,16 @@ fn failed(kind: Kind, out: &str) -> Option<bool> {
     })
 }
 
-/// Run chain steps in order until one fails, all within one `timeout`.
-fn execute_chain(steps: &[Step], dir: &Path, timeout: u64) -> Run {
+/// Run chain steps in order until one fails, all within `wait` (`timeout` is the reported limit).
+fn execute_chain(steps: &[Step], dir: &Path, timeout: u64, wait: Duration) -> Run {
     let start = Instant::now();
-    let deadline = start + Duration::from_secs(timeout);
+    let deadline = start + wait;
     let (mut dir, mut status, mut done) = (dir.to_path_buf(), Status::Pass, Vec::new());
     for step in steps {
         match step {
             Step::Run(c) if status != Status::Pass => done.push((c.to_string(), None)),
             Step::Run(c) => {
-                let rem = deadline.saturating_duration_since(Instant::now());
-                if rem.is_zero() {
-                    status = Status::Timeout;
-                    done.push((
-                        c.to_string(),
-                        Some(Run { status: Status::Timeout, ms: 0, out: String::new(), kind: kind(c), injected: false, timeout, steps: Vec::new() }),
-                    ));
-                    continue;
-                }
-                let r = execute_one(c, &dir, timeout, rem);
+                let r = execute_one(c, &dir, timeout, deadline.saturating_duration_since(Instant::now()));
                 status = r.status.clone();
                 done.push((c.to_string(), Some(r)));
             }
@@ -510,15 +524,69 @@ fn spawn_and_wait(command: &str, dir: &Path, timeout: Duration) -> std::io::Resu
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let mut child = cmd.spawn()?;
     drop(cmd);
-    let status = match child.wait_timeout(timeout)? {
-        Some(s) => exit_status(s),
-        None => {
-            kill_group(&mut child);
-            child.wait()?;
-            Status::Timeout
+    #[cfg(unix)]
+    let slot = track(child.id() as i32);
+    let status = wait_capped(&mut child, &file, timeout);
+    #[cfg(unix)]
+    if let Some(s) = slot {
+        s.store(0, Ordering::SeqCst);
+    }
+    Ok((status?, read_capped(&mut file)?))
+}
+
+/// Wait for `child` up to `timeout`, killing its group early if `out` grows past `OUTPUT_CAP`.
+fn wait_capped(child: &mut Child, out: &File, timeout: Duration) -> std::io::Result<Status> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if let Some(s) = child.wait_timeout(left.min(Duration::from_millis(250)))? {
+            return Ok(exit_status(s));
         }
-    };
-    Ok((status, read_capped(&mut file)?))
+        let status = if out.metadata()?.len() > OUTPUT_CAP {
+            Status::Fail(format!("output over {} MiB, killed", OUTPUT_CAP >> 20))
+        } else if Instant::now() >= deadline {
+            Status::Timeout
+        } else {
+            continue;
+        };
+        kill_group(child);
+        child.wait()?;
+        return Ok(status);
+    }
+}
+
+/// Process groups of running commands, killed by `on_signal` so no child outlives us.
+#[cfg(unix)]
+static LIVE: [AtomicI32; 64] = [const { AtomicI32::new(0) }; 64];
+
+#[cfg(unix)]
+extern "C" fn on_signal(sig: libc::c_int) {
+    // Async-signal-safe only: atomic loads, kill, _exit.
+    for s in &LIVE {
+        let g = s.load(Ordering::SeqCst);
+        if g > 0 {
+            // SAFETY: plain syscalls.
+            unsafe { libc::kill(-g, libc::SIGKILL) };
+        }
+    }
+    unsafe { libc::_exit(128 + sig) };
+}
+
+/// Record a live process group (installing the signal handler once); `None` when all slots are taken.
+#[cfg(unix)]
+fn track(pgid: i32) -> Option<&'static AtomicI32> {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            // SAFETY: on_signal is async-signal-safe; a signal the parent ignored (nohup) stays ignored.
+            unsafe {
+                if libc::signal(sig, on_signal as *const () as libc::sighandler_t) == libc::SIG_IGN {
+                    libc::signal(sig, libc::SIG_IGN);
+                }
+            }
+        }
+    });
+    LIVE.iter().find(|s| s.compare_exchange(0, pgid, Ordering::SeqCst, Ordering::SeqCst).is_ok())
 }
 
 #[cfg(not(windows))]
@@ -685,18 +753,23 @@ fn read_capped(f: &mut File) -> std::io::Result<String> {
 /// Strip ANSI escapes, keep only the last frame of `\r` progress redraws,
 /// trim line ends and collapse blank-line runs.
 fn clean(s: &str) -> String {
-    let mut lines: Vec<String> = Vec::new();
+    // `blank`: nothing kept yet, or the last kept line is empty (so the output then ends with its `\n`).
+    let (mut out, mut blank) = (String::with_capacity(s.len()), true);
     for line in s.split('\n') {
         let frame = line.rsplit('\r').map(strip_ansi).find(|f| !f.trim().is_empty()).unwrap_or_default();
-        let frame = frame.trim_end().to_string();
-        if !(frame.is_empty() && lines.last().is_none_or(|l| l.is_empty())) {
-            lines.push(frame);
+        let frame = frame.trim_end();
+        if !(frame.is_empty() && blank) {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(frame);
+            blank = frame.is_empty();
         }
     }
-    while lines.last().is_some_and(|l| l.is_empty()) {
-        lines.pop();
+    if blank {
+        out.pop(); // the separator before a trailing empty line
     }
-    lines.join("\n")
+    out
 }
 
 fn strip_ansi(s: &str) -> String {
@@ -709,6 +782,9 @@ fn strip_ansi(s: &str) -> String {
         }
         match it.next() {
             Some('[') => while it.next().is_some_and(|c| !('@'..='~').contains(&c)) {},
+            Some('(' | ')' | '*' | '+') => {
+                it.next(); // charset designator, e.g. `ESC ( B`
+            }
             Some(']') => {
                 while let Some(c) = it.next() {
                     if c == '\x07' || (c == '\x1b' && it.next().is_some()) {
@@ -1530,7 +1606,7 @@ error: test failed, to rerun pass `--bin demo`"##;
         assert_eq!(
             out,
             json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": {
-                "command": "{ if cargo check --message-format=json --all-targets; then printf '\\0%s' 0; else printf '\\0%s' \"$?\"; fi; } 2>&1 | /opt/agy/agyfast-rs cli filter --framed 'cargo check --all-targets'",
+                "command": "cargo check --message-format=json --all-targets 2>&1 | /opt/agy/agyfast-rs cli filter 'cargo check --all-targets'",
                 "description": "check", "timeout": 120000, "run_in_background": false, "future_field": {"x": [1]}}}})
         );
         assert!(out["hookSpecificOutput"].get("permissionDecision").is_none());
@@ -1543,20 +1619,20 @@ error: test failed, to rerun pass `--bin demo`"##;
     fn hook_rewrites_each_check_step_of_a_chain() {
         assert_eq!(
             rewritten("cd crates/x && cargo check && cargo test foo").as_deref(),
-            Some("cd crates/x && { if cargo check --message-format=json; then printf '\\0%s' 0; else printf '\\0%s' \"$?\"; fi; } 2>&1 | /opt/agy/agyfast-rs cli filter --framed 'cargo check' && { if cargo test foo; then printf '\\0%s' 0; else printf '\\0%s' \"$?\"; fi; } 2>&1 | /opt/agy/agyfast-rs cli filter --framed 'cargo test foo'")
+            Some("cd crates/x && cargo check --message-format=json 2>&1 | /opt/agy/agyfast-rs cli filter 'cargo check' && cargo test foo 2>&1 | /opt/agy/agyfast-rs cli filter 'cargo test foo'")
         );
         // A trailing 2>&1 is the model's habit, not a wish for raw output; other steps stay as written.
         assert_eq!(
             rewritten("cargo test 2>&1").as_deref(),
-            Some("{ if cargo test; then printf '\\0%s' 0; else printf '\\0%s' \"$?\"; fi; } 2>&1 | /opt/agy/agyfast-rs cli filter --framed 'cargo test'")
+            Some("cargo test 2>&1 | /opt/agy/agyfast-rs cli filter 'cargo test'")
         );
         assert_eq!(
             rewritten("cargo check --all-targets 2>&1 && echo done 2>&1").as_deref(),
-            Some("{ if cargo check --message-format=json --all-targets; then printf '\\0%s' 0; else printf '\\0%s' \"$?\"; fi; } 2>&1 | /opt/agy/agyfast-rs cli filter --framed 'cargo check --all-targets' && echo done 2>&1")
+            Some("cargo check --message-format=json --all-targets 2>&1 | /opt/agy/agyfast-rs cli filter 'cargo check --all-targets' && echo done 2>&1")
         );
         assert_eq!(
             rewritten("cargo run && cargo clippy").as_deref(),
-            Some("cargo run && { if cargo clippy --message-format=json; then printf '\\0%s' 0; else printf '\\0%s' \"$?\"; fi; } 2>&1 | /opt/agy/agyfast-rs cli filter --framed 'cargo clippy'")
+            Some("cargo run && cargo clippy --message-format=json 2>&1 | /opt/agy/agyfast-rs cli filter 'cargo clippy'")
         );
     }
 
@@ -1564,7 +1640,7 @@ error: test failed, to rerun pass `--bin demo`"##;
     #[test]
     fn hook_quotes_the_original_command_for_the_shell() {
         let out = rewritten(r#"cargo test "it's" -- --exact"#).unwrap();
-        assert_eq!(out, r#"{ if cargo test "it's" -- --exact; then printf '\0%s' 0; else printf '\0%s' "$?"; fi; } 2>&1 | /opt/agy/agyfast-rs cli filter --framed 'cargo test "it'\''s" -- --exact'"#);
+        assert_eq!(out, r#"cargo test "it's" -- --exact 2>&1 | /opt/agy/agyfast-rs cli filter 'cargo test "it'\''s" -- --exact'"#);
         // The shell hands the filter the original command back byte for byte.
         let echoed = Command::new("sh").arg("-c").arg(format!("printf %s {}", sh_quote(r#"cargo test "it's" $HOME `x`"#))).output().unwrap();
         assert_eq!(String::from_utf8(echoed.stdout).unwrap(), r#"cargo test "it's" $HOME `x`"#);
@@ -1614,23 +1690,23 @@ error: test failed, to rerun pass `--bin demo`"##;
 
     #[test]
     fn filter_reads_failure_from_the_content() {
-        let (out, failed) = filter("cargo check", CARGO_CHECK, None);
+        let (out, failed) = filter("cargo check", CARGO_CHECK);
         assert!(failed && out.starts_with("[agyfast-rs FAIL] cargo check\nsrc/main.rs:6:18 [E0308]") && out.ends_with("1 error, 1 warning"), "{out}");
-        let (out, failed) = filter("cargo clippy", CARGO_CLIPPY, None);
+        let (out, failed) = filter("cargo clippy", CARGO_CLIPPY);
         assert!(!failed && out == "[agyfast-rs PASS] cargo clippy: 0 errors, 2 warnings", "{out}");
-        let (out, failed) = filter("cargo test", CARGO_TEST, None);
+        let (out, failed) = filter("cargo test", CARGO_TEST);
         assert!(failed && out.contains("test result: FAILED. 1 passed; 1 failed") && !out.contains("ok_one"), "{out}");
-        assert!(filter("go test ./...", GO_TEST, None).1);
-        assert!(filter("npx tsc --noEmit", "src/a.ts(12,5): error TS2322: Type 'string' is not assignable.", None).1);
-        assert!(!filter("npx eslint src", "/r/a.ts\n  9:1  warning  x  no-console\n\n✖ 1 problem (0 errors, 1 warning)", None).1);
-        assert!(!filter("pytest", "===== 3 passed in 0.10s =====", None).1);
-        assert!(filter("pytest", "FAILED t.py::bad - assert 1\n===== 1 failed, 2 passed in 0.10s =====", None).1);
+        assert!(filter("go test ./...", GO_TEST).1);
+        assert!(filter("npx tsc --noEmit", "src/a.ts(12,5): error TS2322: Type 'string' is not assignable.").1);
+        assert!(!filter("npx eslint src", "/r/a.ts\n  9:1  warning  x  no-console\n\n✖ 1 problem (0 errors, 1 warning)").1);
+        assert!(!filter("pytest", "===== 3 passed in 0.10s =====").1);
+        assert!(filter("pytest", "FAILED t.py::bad - assert 1\n===== 1 failed, 2 passed in 0.10s =====").1);
         // Without cargo's JSON (a manifest error), cargo's own error line decides.
-        assert!(filter("cargo check", "error: failed to parse manifest at `/w/Cargo.toml`", None).1);
+        assert!(filter("cargo check", "error: failed to parse manifest at `/w/Cargo.toml`").1);
         let lines: Vec<String> = (1..=500).map(|i| format!("line {i}")).collect();
-        let (out, failed) = filter("make all", &lines.join("\n"), None);
+        let (out, failed) = filter("make all", &lines.join("\n"));
         assert!(!failed && out.starts_with("[agyfast-rs] make all (status not judged)\nline 1\n") && out.ends_with("line 500"), "{out}");
-        assert!(filter("cargo test", &"x".repeat(50_000), None).0.len() <= budget::CAP);
+        assert!(filter("cargo test", &"x".repeat(50_000)).0.len() <= budget::CAP);
     }
 
     #[cfg(unix)] // rustc prints `src\lib.rs` on Windows
@@ -1643,15 +1719,15 @@ error: test failed, to rerun pass `--bin demo`"##;
         let sh = |c: &str| String::from_utf8_lossy(&Command::new("sh").arg("-c").arg(c).current_dir(p).output().unwrap().stdout).into_owned();
         let lib = "pub fn add(a: i32, b: i32) -> i32 { a + b }\n#[test]\nfn good() { assert_eq!(add(1, 2), 3); }\n";
         std::fs::write(p.join("src/lib.rs"), lib).unwrap();
-        let (out, failed) = filter("cargo check", &sh("cargo check --message-format=json 2>&1"), None);
+        let (out, failed) = filter("cargo check", &sh("cargo check --message-format=json 2>&1"));
         assert_eq!((out.as_str(), failed), ("[agyfast-rs PASS] cargo check: 0 errors, 0 warnings", false));
 
         std::fs::write(p.join("src/lib.rs"), format!("{lib}#[test]\nfn bad() {{ assert_eq!(add(2, 2), 5, \"math is broken\"); }}\n")).unwrap();
-        let (out, failed) = filter("cargo test", &sh("cargo test 2>&1"), None);
+        let (out, failed) = filter("cargo test", &sh("cargo test 2>&1"));
         assert!(failed && out.starts_with("[agyfast-rs FAIL] cargo test\n") && out.contains("math is broken") && out.contains("test result: FAILED. 1 passed; 1 failed"), "{out}");
 
         std::fs::write(p.join("src/lib.rs"), "pub fn add(a: i32) -> i32 { let x: i32 = \"five\"; a + x }\n").unwrap();
-        let (out, failed) = filter("cargo check", &sh("cargo check --message-format=json 2>&1"), None);
+        let (out, failed) = filter("cargo check", &sh("cargo check --message-format=json 2>&1"));
         assert!(failed && out.contains("src/lib.rs:1:42 [E0308] mismatched types") && out.ends_with("1 error, 0 warnings"), "{out}");
     }
 
@@ -1802,7 +1878,7 @@ error: test failed, to rerun pass `--bin demo`"##;
             ("go test ./...", "go: cannot find main module, but found .git"),
             ("vitest", "  ✓ handles 1 error 2ms\nTests  1 failed | 1 passed (2)"),
         ] {
-            assert!(filter(cmd, raw, None).1, "expected fail for `{cmd}` on `{raw}`");
+            assert!(filter(cmd, raw).1, "expected fail for `{cmd}` on `{raw}`");
         }
         for (cmd, raw) in [
             ("cargo test", "test tests::test_handles_1_error ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"),
@@ -1810,11 +1886,14 @@ error: test failed, to rerun pass `--bin demo`"##;
             ("vitest", "  ✓ handles 1 error 2ms\n  ✔ handles 2 failures 1ms\n  √ handles 3 errors 1ms\nTests  3 passed (3)"),
             ("go test ./...", "=== RUN   Test_1_error\n--- PASS: Test_1_error (0.00s)\nPASS\nok  \texample.com/x\t0.01s"),
             ("cargo clippy", CARGO_CLIPPY),
+            ("pytest", "===== 3 passed in 0.1s =====\nINFO key: not found, using default"),
+            ("pytest", "ERROR: this is a log line\n===== 3 passed in 0.1s ====="),
+            ("pytest -s", "worker pool: error: retrying\n===== 3 passed in 0.1s ====="),
         ] {
-            assert!(!filter(cmd, raw, None).1, "expected pass for `{cmd}` on `{raw}`");
+            assert!(!filter(cmd, raw).1, "expected pass for `{cmd}` on `{raw}`");
         }
         let long_cmd = format!("cargo check {}", "a".repeat(9000));
-        let (out, failed) = filter(&long_cmd, CARGO_CHECK, None);
+        let (out, failed) = filter(&long_cmd, CARGO_CHECK);
         assert!(failed && out.len() <= budget::CAP, "len={}", out.len());
     }
 
@@ -1890,23 +1969,23 @@ error: test failed, to rerun pass `--bin demo`"##;
     fn execute_chain_and_run_work_cross_platform_including_expired_deadline() {
         let dir = tmp();
         std::fs::create_dir(dir.path().join("sub")).unwrap();
-        let pass = execute_chain(&[Step::Cd("sub"), Step::Run("echo chain_ok")], dir.path(), 10);
+        let pass = execute_chain(&[Step::Cd("sub"), Step::Run("echo chain_ok")], dir.path(), 10, Duration::from_secs(10));
         assert_eq!(pass.status, Status::Pass);
         assert_eq!(pass.steps.len(), 1);
         assert!(pass.steps[0].1.as_ref().unwrap().out.contains("chain_ok"));
 
-        let missing = execute_chain(&[Step::Cd("missing"), Step::Run("echo never")], dir.path(), 10);
+        let missing = execute_chain(&[Step::Cd("missing"), Step::Run("echo never")], dir.path(), 10, Duration::from_secs(10));
         assert_eq!(missing.status, Status::Fail("cd: no such directory: missing".into()));
         assert!(body(&missing, false, budget::CAP).ends_with("Not run: `echo never`"));
 
-        let fail = execute_chain(&[Step::Run("echo one"), Step::Run("exit 4"), Step::Run("echo never")], dir.path(), 10);
+        let fail = execute_chain(&[Step::Run("echo one"), Step::Run("exit 4"), Step::Run("echo never")], dir.path(), 10, Duration::from_secs(10));
         assert_eq!(fail.status, Status::Fail("exit 4".into()));
         assert!(body(&fail, false, budget::CAP).ends_with("Not run: `echo never`"));
 
         // An already-expired deadline records Timeout without spawning the step.
         let marker = dir.path().join("should_not_exist");
         let cmd = if cfg!(windows) { "echo x > should_not_exist" } else { "touch should_not_exist" };
-        let expired = execute_chain(&[Step::Run(cmd), Step::Run("echo skipped")], dir.path(), 0);
+        let expired = execute_chain(&[Step::Run(cmd), Step::Run("echo skipped")], dir.path(), 0, Duration::ZERO);
         assert_eq!(expired.status, Status::Timeout);
         assert_eq!(expired.steps.len(), 2);
         let first = expired.steps[0].1.as_ref().unwrap();
@@ -1920,6 +1999,83 @@ error: test failed, to rerun pass `--bin demo`"##;
         assert!(one.starts_with("Checks: 1/1 passed") && one.contains("single_ok"), "{one}");
         let two = run(json!({"cwd": cwd, "commands": [{"command": "echo a"}, {"command": "exit 2"}]})).unwrap();
         assert!(two.starts_with("Checks: 1/2 passed, 1 failed") && two.contains("FAIL (exit 2)"), "{two}");
+    }
+
+    #[test]
+    fn filter_fails_on_usage_conftest_eslint_crash_and_no_tests() {
+        for (cmd, raw) in [
+            ("pytest --nope", "ERROR: usage: pytest [options]\npytest: error: unrecognized arguments: --nope"),
+            ("pytest", "ImportError while loading conftest '/w/tests/conftest.py'.\nE   ModuleNotFoundError: No module named 'x'"),
+            ("npx eslint src", "Oops! Something went wrong! :(\n\nESLint: 9.0.0"),
+            ("npx jest", "No tests found, exiting with code 1\nRun with `--passWithNoTests` to exit with code 0"),
+        ] {
+            assert!(filter(cmd, raw).1, "expected fail for `{cmd}` on `{raw}`");
+        }
+        assert!(!filter("npx jest --passWithNoTests", "No tests found, exiting with code 0").1);
+    }
+
+    #[test]
+    fn verbose_pytest_passed_lines_are_passing() {
+        assert!(!filter("pytest -v", "tests/t.py::test_parse[1-error] PASSED\n===== 2 passed in 0.01s =====").1);
+    }
+
+    #[test]
+    fn charset_designator_escape_is_stripped() {
+        assert_eq!(strip_ansi("\x1b(BFAIL a \x1b)0x\x1b*Ay\x1b+Bz"), "FAIL a xyz");
+        assert!(filter("npx jest", "\x1b(BFAIL src/a.test.js").1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runaway_output_is_killed_at_the_cap() {
+        let r = execute("yes", tmp().path(), 60);
+        assert_eq!(r.status, Status::Fail(format!("output over {} MiB, killed", OUTPUT_CAP >> 20)));
+        assert!(r.ms < 30_000, "took {}ms", r.ms);
+    }
+
+    #[test]
+    fn clean_keeps_one_buffer_and_collapses_like_before() {
+        assert_eq!(clean(""), "");
+        assert_eq!(clean("\n\n\na\n\n\nb\r\n\n"), "a\n\nb");
+        let big = "x\n".repeat(1 << 20);
+        assert_eq!(clean(&big).len(), big.len() - 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_process_groups_are_tracked_for_the_signal_handler() {
+        let dir = tmp();
+        let p = dir.path().to_path_buf();
+        let t = std::thread::spawn(move || execute("echo $$ > pid; sleep 1", &p, 10));
+        let pid = (0..100)
+            .find_map(|_| {
+                std::thread::sleep(Duration::from_millis(20));
+                std::fs::read_to_string(dir.path().join("pid")).ok().and_then(|s| s.trim().parse::<i32>().ok())
+            })
+            .unwrap();
+        assert!(LIVE.iter().any(|s| s.load(Ordering::SeqCst) == pid), "pgid {pid} not tracked");
+        assert_eq!(t.join().unwrap().status, Status::Pass);
+        assert!(!LIVE.iter().any(|s| s.load(Ordering::SeqCst) == pid), "pgid {pid} not cleared");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_deadline_covers_queued_commands() {
+        let dir = tmp();
+        let started = Instant::now();
+        let out = run(json!({
+            "cwd": dir.path().to_str().unwrap(), "concurrency": 1, "timeoutSec": 1,
+            "commands": [{"command": "sleep 2"}, {"command": "sleep 2"}, {"command": "sleep 2"}]
+        }))
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(1800), "took {:?}", started.elapsed());
+        assert!(out.starts_with("Checks: 0/3 passed, 3 failed") && out.matches("## [TIMEOUT ").count() == 3, "{out}");
+    }
+
+    #[test]
+    fn cd_with_inner_quotes_runs_through_the_shell() {
+        assert_eq!(split_chain("cd \"my dir\"/sub && pwd"), None);
+        assert_eq!(split_chain("cd 'a b' && pwd"), Some(vec![Step::Cd("a b"), Step::Run("pwd")]));
     }
 
     #[test]

@@ -14,8 +14,16 @@ struct Args {
     #[serde(default)]
     outlines: Vec<String>,
     #[serde(default)]
+    slices: Vec<Slice>,
+    #[serde(default)]
     line_ranges: Vec<String>,
     max_chars: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct Slice {
+    path: String,
+    ranges: Vec<Vec<i64>>,
 }
 
 enum Job {
@@ -26,14 +34,21 @@ enum Job {
 
 pub fn run(args: Value) -> Result<String, String> {
     let args: Args = serde_json::from_value(args).map_err(|e| format!("Error: invalid arguments: {e}"))?;
-    if args.outlines.is_empty() && args.line_ranges.is_empty() {
-        return Err("Error: provide at least one of `outlines` or `lineRanges`".into());
+    if args.outlines.is_empty() && args.slices.is_empty() && args.line_ranges.is_empty() {
+        return Err("Error: provide at least one of `outlines`, `slices` or `lineRanges`".into());
     }
     if args.outlines.len() > 40 {
         return Err(format!("Error: at most 40 outlines, got {}", args.outlines.len()));
     }
     let dir = cwd::resolve(args.cwd.as_deref())?;
     let jobs: Vec<Job> = args.outlines.into_iter().map(Job::Outline)
+        .chain(args.slices.into_iter().map(|s| {
+            let ranges = s.ranges.iter().map(|r| match r[..] {
+                [a, b] => Ok((a, b)),
+                _ => Err(format!("each range must be [start, end], got {r:?}")),
+            }).collect();
+            Job::Slice(s.path, ranges)
+        }))
         .chain(args.line_ranges.iter().map(|s| parse_line_ranges(s)))
         .collect();
     let parts: Vec<String> = jobs.par_iter().map(|job| match job {
@@ -127,6 +142,17 @@ mod tests {
         assert!(out.contains("--- L1-2 ---\n1: рядок 1 🌍\n2: рядок 2 🌍\n--- L7-7 ---\n7: рядок 7 🌍"));
         assert!(out.contains("## Slice: missing.txt\nERROR:"));
         assert!(out.contains("ERROR: bad range \"x-y\""));
+    }
+
+    #[test]
+    fn slices_input_works_with_line_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "1\n2\n3\n4\n").unwrap();
+        let out = run(json!({"cwd": dir.path(), "slices": [{"path": "a.txt", "ranges": [[2, 3], [1]]}], "lineRanges": ["a.txt:4"]})).unwrap();
+        assert!(out.contains("--- L2-3 ---\n2: 2\n3: 3"), "{out}");
+        assert!(out.contains("ERROR: each range must be [start, end], got [1]"), "{out}");
+        assert!(out.contains("--- L4-4 ---\n4: 4"), "{out}");
+        assert!(run(json!({"cwd": dir.path()})).unwrap_err().contains("`outlines`, `slices` or `lineRanges`"));
     }
 
     #[test]

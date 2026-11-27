@@ -1,8 +1,2 @@
 target/
 plugin/bin/
-# third-party behavioural reference, not ours to ship
-reference/
-dist/
-/report/
-issue.md
-docs/SWARM_AUDIT_AICLIPHELPER.md

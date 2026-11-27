@@ -7,6 +7,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -20,8 +23,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Toolchain
         run: rustup update stable && rustup default stable && rustup component add clippy
+      - name: Crate and plugin versions match
+        shell: bash
+        run: v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1) && grep -q "\"version\": \"$v\"" plugin/plugin.json
       - name: Test
         run: cargo test --locked
       - name: Clippy

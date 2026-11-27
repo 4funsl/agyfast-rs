@@ -41,3 +41,12 @@ fn mcp_session_over_stdio() {
     // toolSummary must not make the call a protocol error.
     assert!(replies[2].get("error").is_none() && replies[2]["result"]["content"].is_array());
 }
+
+#[test]
+fn a_non_utf8_frame_gets_a_parse_error_and_the_server_lives_on() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agyfast-rs")).arg("mcp").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"\xff\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let replies: Vec<Value> = String::from_utf8(out.stdout).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!((replies[0]["error"]["code"].clone(), replies[1]["id"].clone()), (json!(-32700), json!(1)), "{replies:?}");
+}

@@ -55,7 +55,17 @@ struct Plan {
     new: Vec<u8>,
     /// Previous content and permissions, `None` for a new file; used for rollback.
     old: Option<(Vec<u8>, Permissions)>,
+    /// Length and mtime when read; the write fails if the file changed since.
+    stamp: Option<Stamp>,
+    /// A create without `overwrite`: publish only if nothing is there yet.
+    noclobber: bool,
     summary: String,
+}
+
+type Stamp = (u64, std::time::SystemTime);
+
+fn stamp(m: &fs::Metadata) -> Option<Stamp> {
+    m.modified().ok().map(|t| (m.len(), t))
 }
 
 fn line_count(s: &str) -> i64 {
@@ -139,7 +149,9 @@ fn window(starts: &[usize], len: usize, s: Option<usize>, e: Option<usize>) -> R
 }
 
 fn plan_hunks(display: &str, content: &str, hunks: &[&Hunk]) -> Result<(String, String), String> {
-    let crs: Vec<_> = content.match_indices("\r\n").enumerate().map(|(i, (o, _))| o - i).collect();
+    // A target with a lone `\r` must match the raw bytes, so skip LF normalisation for the whole call.
+    let raw = hunks.iter().any(|h| h.target.replace("\r\n", "").contains('\r'));
+    let crs: Vec<_> = if raw { Vec::new() } else { content.match_indices("\r\n").enumerate().map(|(i, (o, _))| o - i).collect() };
     let normalized = if crs.is_empty() { std::borrow::Cow::Borrowed(content) } else { std::borrow::Cow::Owned(content.replace("\r\n", "\n")) };
     // CRs before a logical offset are the extra bytes at its on-disk position.
     let original = |o| o + crs.partition_point(|&cr| cr < o);
@@ -147,7 +159,7 @@ fn plan_hunks(display: &str, content: &str, hunks: &[&Hunk]) -> Result<(String, 
     let mut spans = Vec::new();
     let mut errors = Vec::new();
     for (i, h) in hunks.iter().enumerate() {
-        let (t, r) = (h.target.replace("\r\n", "\n"), h.replacement.replace("\r\n", "\n"));
+        let (t, r) = if raw { (h.target.clone(), h.replacement.clone()) } else { (h.target.replace("\r\n", "\n"), h.replacement.replace("\r\n", "\n")) };
         let err = |m: String| format!("{display} hunk #{}: {m}", i + 1);
         if t.is_empty() {
             errors.push(err("empty target".into()));
@@ -226,8 +238,11 @@ fn plan_hunks(display: &str, content: &str, hunks: &[&Hunk]) -> Result<(String, 
     Ok((out, summary))
 }
 
-fn plan(job: &Job) -> Result<Plan, String> {
+fn plan(job: &Job, cwd: &Path) -> Result<Plan, String> {
     let d = &job.display;
+    if !job.path.starts_with(cwd) {
+        return Err(format!("{d}: outside the working directory, refusing to write"));
+    }
     let creates = job.entries.iter().filter(|e| e.create.is_some()).count();
     if creates > 0 && job.entries.len() > 1 {
         return Err(format!("{d}: listed {} times including `create`; give a created file once", job.entries.len()));
@@ -242,25 +257,28 @@ fn plan(job: &Job) -> Result<Plan, String> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
         Err(e) => return Err(format!("{d}: cannot stat: {e}")),
         Ok(_) => match fs::metadata(&job.path) {
-            Ok(m) if m.is_file() => Some(m.permissions()),
+            Ok(m) if m.is_file() => Some((m.permissions(), stamp(&m))),
             Ok(_) => return Err(format!("{d}: not a regular file")),
             Err(_) => return Err(format!("{d}: dangling symlink, refusing to write through it")),
         },
     };
-    let read = |perms: Permissions| fs::read(&job.path).map(|b| (b, perms)).map_err(|e| format!("{d}: cannot read: {e}"));
+    let read = |(perms, _): (Permissions, _)| fs::read(&job.path).map(|b| (b, perms)).map_err(|e| format!("{d}: cannot read: {e}"));
+    let st = existing.as_ref().and_then(|e| e.1);
     if let Some(text) = &job.entries[0].create {
         return match existing {
             Some(_) if !job.entries[0].overwrite => Err(format!("{d}: already exists; set overwrite: true to replace it")),
             Some(perms) => {
                 let old = read(perms)?;
                 let delta = line_count(text) - line_count(&String::from_utf8_lossy(&old.0));
-                Ok(Plan { display: d.clone(), path: job.path.clone(), new: text.clone().into_bytes(), old: Some(old), summary: format!("- {d}: overwritten, lines {delta:+}") })
+                Ok(Plan { display: d.clone(), path: job.path.clone(), new: text.clone().into_bytes(), old: Some(old), stamp: st, noclobber: false, summary: format!("- {d}: overwritten, lines {delta:+}") })
             }
             None => Ok(Plan {
                 display: d.clone(),
                 path: job.path.clone(),
                 new: text.clone().into_bytes(),
                 old: None,
+                stamp: None,
+                noclobber: !job.entries[0].overwrite,
                 summary: format!("- {d}: created, lines +{}", line_count(text)),
             }),
         };
@@ -272,11 +290,11 @@ fn plan(job: &Job) -> Result<Plan, String> {
     let content = std::str::from_utf8(&old.0).map_err(|_| format!("{d}: not UTF-8 text, refusing to edit"))?;
     let hunks: Vec<&Hunk> = job.entries.iter().flat_map(|e| e.hunks.iter().flatten()).collect();
     let (new, summary) = plan_hunks(d, content, &hunks)?;
-    Ok(Plan { display: d.clone(), path: job.path.clone(), new: new.into_bytes(), old: Some(old), summary })
+    Ok(Plan { display: d.clone(), path: job.path.clone(), new: new.into_bytes(), old: Some(old), stamp: st, noclobber: false, summary })
 }
 
 /// Temp file in the target's directory, then rename over it: readers never see a partial file.
-fn write_atomic(path: &Path, bytes: &[u8], perms: Option<&Permissions>, #[cfg_attr(not(windows), allow(unused_variables))] replaced: &mut bool) -> io::Result<()> {
+fn write_atomic(path: &Path, bytes: &[u8], perms: Option<&Permissions>, stamp_read: Option<Stamp>, noclobber: bool, #[cfg_attr(not(windows), allow(unused_variables))] replaced: &mut bool) -> io::Result<()> {
     let dir = path.parent().ok_or_else(|| io::Error::other("path has no parent directory"))?;
     fs::create_dir_all(dir)?;
     #[cfg_attr(not(unix), allow(unused_mut))] // only Unix sets permissions below
@@ -304,6 +322,14 @@ fn write_atomic(path: &Path, bytes: &[u8], perms: Option<&Permissions>, #[cfg_at
         tmp.as_file().set_permissions(p.clone())?;
     }
     tmp.as_file().sync_all()?;
+    // shortcut: a save landing between this check and the rename is still lost; closing that needs OS-level locking editors don't use.
+    if stamp_read.is_some() && fs::metadata(path).ok().as_ref().and_then(stamp) != stamp_read {
+        return Err(io::Error::other("changed on disk since it was read"));
+    }
+    if noclobber {
+        tmp.persist_noclobber(path).map_err(|e| if e.error.kind() == io::ErrorKind::AlreadyExists { io::Error::other("already exists (created concurrently or under another spelling)") } else { e.error })?;
+        return Ok(());
+    }
     #[cfg(windows)]
     return persist_windows(tmp, path, perms, replaced);
     #[cfg(not(windows))]
@@ -363,7 +389,7 @@ fn bullets(header: &str, items: &[String], max: usize) -> String {
 
 fn rollback(w: &Plan) -> Result<(), String> {
     let res = match &w.old {
-        Some((bytes, perms)) => write_atomic(&w.path, bytes, Some(perms), &mut false),
+        Some((bytes, perms)) => write_atomic(&w.path, bytes, Some(perms), None, false, &mut false),
         None => fs::remove_file(&w.path),
     };
     res.map_err(|e| format!("{}: {e}", w.display))
@@ -374,7 +400,7 @@ fn commit<'a>(plans: &'a [Plan], best_effort: bool, failed: &mut Vec<String>) ->
     let mut rb_err: Vec<String> = Vec::new();
     for p in plans {
         let mut replaced = false;
-        match write_atomic(&p.path, &p.new, p.old.as_ref().map(|o| &o.1), &mut replaced) {
+        match write_atomic(&p.path, &p.new, p.old.as_ref().map(|o| &o.1), p.stamp, p.noclobber, &mut replaced) {
             Ok(()) => written.push(p),
             Err(e) if best_effort => {
                 let mut msg = format!("{}: write failed: {e}", p.display);
@@ -432,7 +458,7 @@ pub fn run(args: Value) -> Result<String, String> {
     }
     let mut plans = Vec::new();
     let mut failed = Vec::new();
-    for r in jobs.iter().map(plan) {
+    for r in jobs.iter().map(|j| plan(j, &cwd)) {
         match r {
             Ok(p) => plans.push(p),
             Err(e) => failed.push(e),
@@ -655,6 +681,13 @@ mod tests {
     }
 
     #[test]
+    fn lone_cr_target_matches_raw_bytes() {
+        let d = setup(&[("crlf.txt", "x\r\ny\r\n")]);
+        edit(&d, json!({"edits": [{"path": "crlf.txt", "hunks": [{"target": "x\r", "replacement": "z\r"}]}]})).unwrap();
+        assert_eq!(read(&d, "crlf.txt"), "z\r\ny\r\n");
+    }
+
+    #[test]
     fn mixed_crlf_lf_hunk_edits_lf_block() {
         let d = setup(&[("mix.txt", "head\r\nline1\nline2\ntail\r\n")]);
         edit(&d, json!({"edits": [{"path": "mix.txt", "hunks": [{"target": "line1\nline2", "replacement": "L1\nL2\nL3"}]}]})).unwrap();
@@ -672,9 +705,9 @@ mod tests {
         let blocker = d.path().join("blocker");
         fs::create_dir(&blocker).unwrap();
         let plans = vec![
-            Plan { display: "a.txt".into(), path: a_path.clone(), new: b"new\n".to_vec(), old: Some((b"old\n".to_vec(), a_perms)), summary: String::new() },
-            Plan { display: "new.txt".into(), path: created.clone(), new: b"hi\n".to_vec(), old: None, summary: String::new() },
-            Plan { display: "blocker".into(), path: blocker.clone(), new: b"x".to_vec(), old: None, summary: String::new() },
+            Plan { display: "a.txt".into(), path: a_path.clone(), new: b"new\n".to_vec(), old: Some((b"old\n".to_vec(), a_perms)), stamp: None, noclobber: false, summary: String::new() },
+            Plan { display: "new.txt".into(), path: created.clone(), new: b"hi\n".to_vec(), old: None, stamp: None, noclobber: false, summary: String::new() },
+            Plan { display: "blocker".into(), path: blocker.clone(), new: b"x".to_vec(), old: None, stamp: None, noclobber: false, summary: String::new() },
         ];
         let err = commit(&plans, false, &mut Vec::new()).err().unwrap();
         assert!(err.contains("rolled back 2 file(s) (0 files modified)"), "{err}");
@@ -686,13 +719,71 @@ mod tests {
         // Duplicate created path forces second rollback's remove_file to fail.
         let dup = d.path().join("dup.txt");
         let rb_plans = vec![
-            Plan { display: "dup.txt".into(), path: dup.clone(), new: b"1".to_vec(), old: None, summary: String::new() },
-            Plan { display: "dup.txt".into(), path: dup, new: b"2".to_vec(), old: None, summary: String::new() },
-            Plan { display: "blocker".into(), path: blocker, new: b"x".to_vec(), old: None, summary: String::new() },
+            Plan { display: "dup.txt".into(), path: dup.clone(), new: b"1".to_vec(), old: None, stamp: None, noclobber: false, summary: String::new() },
+            Plan { display: "dup.txt".into(), path: dup, new: b"2".to_vec(), old: None, stamp: None, noclobber: false, summary: String::new() },
+            Plan { display: "blocker".into(), path: blocker, new: b"x".to_vec(), old: None, stamp: None, noclobber: false, summary: String::new() },
         ];
         let rb_err = commit(&rb_plans, false, &mut Vec::new()).err().unwrap();
         assert!(rb_err.contains("rollback failed") && rb_err.contains("dup.txt"), "{rb_err}");
         assert!(!rb_err.contains("0 files modified") && !rb_err.contains("left unchanged"), "{rb_err}");
+    }
+
+    #[test]
+    fn second_create_of_same_file_fails_and_rolls_back() {
+        let d = setup(&[]);
+        let p = d.path().join("new.txt");
+        let mk = |text: &[u8]| Plan { display: "new.txt".into(), path: p.clone(), new: text.to_vec(), old: None, stamp: None, noclobber: true, summary: String::new() };
+        let err = commit(&[mk(b"one\n"), mk(b"two\n")], false, &mut Vec::new()).err().unwrap();
+        assert!(err.contains("already exists") && err.contains("rolled back 1 file(s) (0 files modified)"), "{err}");
+        assert!(!p.exists());
+        // Case-insensitive volumes (APFS, NTFS): two spellings in one batch are one file.
+        fs::write(d.path().join("probe"), "").unwrap();
+        let case_insensitive = d.path().join("PROBE").exists();
+        fs::remove_file(d.path().join("probe")).unwrap();
+        if case_insensitive {
+            let both = edit(&d, json!({"edits": [{"path": "New.txt", "create": "one\n"}, {"path": "new.txt", "create": "two\n"}]}));
+            assert!(both.unwrap_err().contains("0 files modified"));
+            assert!(fs::read_dir(d.path()).unwrap().next().is_none());
+        }
+    }
+
+    #[test]
+    fn writes_outside_cwd_are_rejected() {
+        let outer = tempfile::tempdir().unwrap();
+        let work = outer.path().join("work");
+        fs::create_dir(&work).unwrap();
+        let run_in = |path: &str| run(json!({"cwd": work.to_str().unwrap(), "edits": [{"path": path, "create": "x"}]}));
+        let abs_out = outer.path().join("abs.txt");
+        let mut bad = vec!["../esc.txt".to_string(), abs_out.to_str().unwrap().to_string()];
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outer.path(), work.join("up")).unwrap();
+            bad.push("up/via-link.txt".into());
+        }
+        for b in &bad {
+            let e = run_in(b).unwrap_err();
+            assert!(e.contains("outside the working directory") && e.contains("0 files modified"), "{b}: {e}");
+        }
+        assert_eq!(fs::read_dir(outer.path()).unwrap().count(), 1); // only `work`
+        assert!(!outer.path().join("esc.txt").exists() && !abs_out.exists() && !outer.path().join("via-link.txt").exists());
+        run_in(work.join("inside.txt").to_str().unwrap()).unwrap();
+        assert_eq!(fs::read_to_string(work.join("inside.txt")).unwrap(), "x");
+    }
+
+    #[test]
+    fn file_changed_between_read_and_write_is_not_overwritten() {
+        let d = setup(&[("e.txt", "old\n"), ("f.txt", "f\n")]);
+        let job = |name: &str, t: &str| Job {
+            display: name.into(),
+            path: cwd::canonical(&d.path().join(name)),
+            entries: serde_json::from_value(json!([{"path": name, "hunks": [{"target": t, "replacement": "NEW"}]}])).unwrap(),
+        };
+        let cwd = cwd::canonical(d.path());
+        let plans = vec![plan(&job("f.txt", "f"), &cwd).unwrap(), plan(&job("e.txt", "old"), &cwd).unwrap()];
+        fs::write(d.path().join("e.txt"), "saved by editor\n").unwrap();
+        let err = commit(&plans, false, &mut Vec::new()).err().unwrap();
+        assert!(err.contains("changed on disk since it was read") && err.contains("0 files modified"), "{err}");
+        assert_eq!((read(&d, "e.txt").as_str(), read(&d, "f.txt").as_str()), ("saved by editor\n", "f\n"));
     }
 
     #[test]

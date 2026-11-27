@@ -122,3 +122,40 @@ fn concurrent_two_file_reverse_order_edits_do_not_deadlock() {
     assert_eq!(std::fs::read_to_string(&a).unwrap(), expected);
     assert_eq!(std::fs::read_to_string(&b).unwrap(), expected);
 }
+
+#[test]
+fn concurrent_edits_with_different_tmpdir_lose_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let tmps = tempfile::tempdir().unwrap();
+    let file = dir.path().join("shared.txt");
+    std::fs::write(&file, file_text(&[false; WORKERS])).unwrap();
+    let mut children: Vec<_> = (0..WORKERS)
+        .map(|i| {
+            let tmp = tmps.path().join(i.to_string());
+            std::fs::create_dir(&tmp).unwrap();
+            Command::new(env!("CARGO_BIN_EXE_agyfast-rs"))
+                .args(["cli", "edit", "--cwd", dir.path().to_str().unwrap(), "--stdin"])
+                .env("TMPDIR", &tmp)
+                .env("TEMP", &tmp)
+                .env("TMP", &tmp)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for (i, child) in children.iter_mut().enumerate() {
+        let payload = serde_json::json!({"edits": [{"path": "shared.txt", "hunks": [
+            {"target": marker(i, "pending"), "replacement": marker(i, "edited")}
+        ]}]});
+        child.stdin.take().unwrap().write_all(payload.to_string().as_bytes()).unwrap();
+    }
+    for (i, child) in children.into_iter().enumerate() {
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "worker {i} failed: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    }
+    let after = std::fs::read_to_string(&file).unwrap();
+    let lost: Vec<usize> = (0..WORKERS).filter(|&i| !after.contains(&marker(i, "edited"))).collect();
+    assert!(lost.is_empty(), "lost edits from workers {lost:?}");
+}

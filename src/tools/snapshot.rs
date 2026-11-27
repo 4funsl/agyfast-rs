@@ -13,18 +13,50 @@ const GIT_TIMEOUT: Duration = Duration::from_millis(800);
 const GIT_CAP: usize = 64 * 1024;
 const SKIP_DIRS: &[&str] = &["node_modules", "target", "dist", "build", "out", "venv", "__pycache__", "vendor"];
 
-fn git_child(cwd: &Path, args: &[&str]) -> Option<std::process::Child> {
-    Command::new("git")
-        .args(["--no-optional-locks", "-c", "core.quotePath=false", "-c", "core.fsmonitor=false", "--no-pager"])
-        .args(args)
+/// `git` with the programs a repository can configure (pager, fsmonitor, external diff, signing,
+/// and the clean/smudge drivers named in `filters`, from `git_filters`) switched off.
+pub(crate) fn git_command(cwd: &Path, filters: &[String]) -> Command {
+    let mut c = Command::new("git");
+    c.args(["--no-pager", "--no-optional-locks"])
+        .args(
+            ["core.fsmonitor=false", "core.quotePath=false", "core.pager=cat", "diff.external=", "gpg.program=false",
+             "gpg.openpgp.program=false", "gpg.ssh.program=false", "gpg.x509.program=false"]
+                .iter()
+                .flat_map(|c| ["-c", c]),
+        )
+        .args(filters.iter().flat_map(|n| {
+            ["clean=", "smudge=", "process=", "required=false"].map(|k| format!("filter.{n}.{k}")).into_iter().flat_map(|o| ["-c".to_string(), o])
+        }))
         .current_dir(cwd)
+        .env("GIT_PAGER", "cat")
+        .env("PAGER", "cat")
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()
+        .env_remove("GIT_EXTERNAL_DIFF")
+        .stdin(Stdio::null());
+    c
+}
+
+/// Names of the configured filter drivers; `None` when they cannot all be read or overridden.
+pub(crate) fn git_filters(cwd: &Path, deadline: Instant) -> Option<Vec<String>> {
+    let (out, truncated) = git_finish(git_start(git_child(cwd, &[], &["config", "-z", "--name-only", "--get-regexp", r"^filter\."])), deadline)?;
+    let mut names: Vec<String> = Vec::new();
+    for key in out.split('\0').filter(|k| !k.is_empty()) {
+        let name = key.strip_prefix("filter.").and_then(|k| k.rsplit_once('.')).map(|(n, _)| n)?;
+        // `-c` splits at the first '='; a lossy-decoded name would not match the driver.
+        if name.contains(['=', '\u{FFFD}']) {
+            return None;
+        }
+        if !names.iter().any(|n| n == name) {
+            names.push(name.to_string());
+        }
+    }
+    (!truncated).then_some(names)
+}
+
+fn git_child(cwd: &Path, filters: &[String], args: &[&str]) -> Option<std::process::Child> {
+    git_command(cwd, filters).args(args).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()
 }
 
 struct RunningGit {
@@ -54,7 +86,9 @@ fn git_finish(running: Option<RunningGit>, deadline: Instant) -> Option<(String,
                 let complete = buf[..GIT_CAP].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
                 buf.truncate(complete);
             }
-            if st.success() || truncated {
+            // Exit 1 with no output is `git config --get-regexp` finding nothing; status and log
+            // treat empty output as unavailable anyway.
+            if st.success() || truncated || (st.code() == Some(1) && buf.is_empty()) {
                 Some((String::from_utf8_lossy(&buf).into_owned(), truncated))
             } else {
                 None
@@ -71,10 +105,11 @@ fn git_finish(running: Option<RunningGit>, deadline: Instant) -> Option<(String,
 /// Branch, dirty/untracked counts and the last commit subjects; `None` outside a repo.
 fn git_section(cwd: &Path) -> Option<String> {
     cwd.ancestors().find(|d| d.join(".git").exists())?;
-    // Both git processes and their stdout readers run concurrently under one deadline.
-    let status = git_start(git_child(cwd, &["status", "--porcelain=v1", "--branch"]));
-    let log = git_start(git_child(cwd, &["log", "-n", "3", "--format=%h %s"]));
+    // All git processes and their stdout readers run under one deadline; status waits for the
+    // filter list (it may run clean filters), log runs alongside.
     let deadline = Instant::now() + GIT_TIMEOUT;
+    let log = git_start(git_child(cwd, &[], &["log", "--no-show-signature", "-n", "3", "--format=%h %s"]));
+    let status = git_filters(cwd, deadline).and_then(|f| git_start(git_child(cwd, &f, &["status", "--porcelain=v1", "--branch"])));
     let status = git_finish(status, deadline);
     let log = git_finish(log, deadline);
     let mut text = String::from("Git: ");
@@ -308,6 +343,30 @@ mod tests {
     }
 
     #[test]
+    fn repo_filter_drivers_do_not_run() {
+        let d = dir();
+        let p = d.path();
+        let git = |a: &[&str]| assert!(Command::new("git").args(a).current_dir(p).output().unwrap().status.success());
+        git(&["init", "-q"]);
+        std::fs::write(p.join(".gitattributes"), "a.txt filter=evil\n").unwrap();
+        std::fs::write(p.join("a.txt"), "x\n").unwrap();
+        git(&["add", "."]);
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "c"]);
+        git(&["config", "filter.evil.clean", "touch marker; cat"]);
+        // Same size, new mtime: status has to re-filter the file to compare it.
+        let bump = |t| std::fs::File::options().write(true).open(p.join("a.txt")).unwrap().set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(t)).unwrap();
+        bump(1000);
+        git(&["status"]); // the setup does run the filter without the overrides
+        assert!(std::fs::remove_file(p.join("marker")).is_ok());
+        bump(2000);
+        assert_eq!(git_filters(p, Instant::now() + Duration::from_secs(10)), Some(vec!["evil".to_string()]));
+        assert!(snapshot(p).contains("0 dirty"));
+        let out = crate::tools::search::run(json!({"cwd": p, "queries": [{"type": "git", "pattern": "diff --stat"}]})).unwrap();
+        assert!(out.contains("(empty output)"), "{out}");
+        assert!(!p.join("marker").exists());
+    }
+
+    #[test]
     fn hook_output_shape_follows_the_payload() {
         let d = dir();
         let cwd = d.path().to_str().unwrap();
@@ -344,7 +403,7 @@ mod tests {
         let hash = Command::new("git").args(["hash-object", "-w", "blob.bin"]).current_dir(p).output().unwrap();
         assert!(hash.status.success());
         let hash = String::from_utf8(hash.stdout).unwrap();
-        let running = git_start(git_child(p, &["cat-file", "blob", hash.trim()]));
+        let running = git_start(git_child(p, &[], &["cat-file", "blob", hash.trim()]));
         let (out, truncated) = git_finish(running, Instant::now() + GIT_TIMEOUT).unwrap();
         assert!(truncated && out.ends_with('\n'));
         assert_eq!(out.len(), GIT_CAP + 2); // drop two partial bytes, gain four decoding invalid UTF-8

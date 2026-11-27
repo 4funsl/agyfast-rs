@@ -2,7 +2,7 @@
 //! concurrently; each result is printed under its own header.
 
 use crate::core::{budget, cwd};
-use crate::tools::outline;
+use crate::tools::{outline, snapshot};
 use globset::{GlobBuilder, GlobMatcher};
 use grep_matcher::Matcher;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
@@ -15,10 +15,11 @@ use serde_json::Value;
 use std::cell::OnceCell;
 use std::collections::BTreeMap;
 use std::fmt::Write;
+use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::process::Stdio;
+use std::time::{Duration, Instant};
 use wait_timeout::ChildExt;
 
 #[derive(Deserialize)]
@@ -146,7 +147,8 @@ fn fit_list(items: &[String], total: usize, what: &str, room: usize) -> String {
 }
 
 fn run_query(q: &Query, base: &Path, unreadable: &mut usize) -> Result<Body, String> {
-    if q.pattern.trim().is_empty() {
+    // Whitespace is a real text/regex pattern (a tab, two spaces); elsewhere it means nothing.
+    if q.pattern.is_empty() || (q.pattern.trim().is_empty() && !matches!(q.kind.as_str(), "text" | "regex")) {
         return Err("pattern must not be empty".into());
     }
     let root = base.join(q.path.as_deref().unwrap_or(""));
@@ -158,11 +160,11 @@ fn run_query(q: &Query, base: &Path, unreadable: &mut usize) -> Result<Body, Str
         "glob" => {
             let m = path_glob(&q.pattern)?;
             let hidden = !(q.pattern.starts_with('.') || slashes(&q.pattern).contains("/."));
-            let files: Vec<_> = walk(&root, q, hidden)?.into_iter().filter(|f| m(&root, f)).collect();
+            let files: Vec<_> = walk(&root, q, hidden, unreadable)?.into_iter().filter(|f| m(&root, f)).collect();
             Ok(list(&files, base, q.max_results.unwrap_or(80)))
         }
         "fuzzy" => {
-            let mut scored: Vec<(i64, String)> = walk(&root, q, true)?
+            let mut scored: Vec<(i64, String)> = walk(&root, q, true, unreadable)?
                 .iter()
                 .map(|f| rel(base, f))
                 .filter_map(|p| Some((fuzzy_score(&q.pattern, &p)?, p)))
@@ -232,7 +234,8 @@ fn file_types(ft: &str) -> Result<Types, String> {
 
 /// Files under `root` honouring .gitignore, the skip list, `glob` and `fileType`,
 /// sorted by path (or newest first with `sortBy: "mtime"`).
-fn walk(root: &Path, q: &Query, hidden: bool) -> Result<Vec<PathBuf>, String> {
+/// Directories that cannot be read are added to `unreadable`.
+fn walk(root: &Path, q: &Query, hidden: bool, unreadable: &mut usize) -> Result<Vec<PathBuf>, String> {
     let glob = q.glob.as_deref().map(path_glob).transpose()?;
     let types = q.file_type.as_deref().map(file_types).transpose()?;
     let mut files: Vec<PathBuf> = WalkBuilder::new(root)
@@ -244,7 +247,7 @@ fn walk(root: &Path, q: &Query, hidden: bool) -> Result<Vec<PathBuf>, String> {
                     && e.file_name().to_str().is_some_and(|n| SKIP_DIRS.contains(&n)))
         })
         .build()
-        .filter_map(Result::ok)
+        .filter_map(|e| e.inspect_err(|_| *unreadable += 1).ok())
         .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
         .map(|e| e.into_path())
         .filter(|f| glob.as_ref().is_none_or(|g| g(root, f)))
@@ -336,20 +339,22 @@ fn search(q: &Query, root: &Path, base: &Path, unreadable: &mut usize) -> Result
     mb.case_insensitive(q.case_sensitive == Some(false))
         .fixed_strings(q.kind == "text")
         .multi_line(true)
-        .crlf(true)
+        // CRLF mode bans `\n` in the pattern, which multi-line search needs.
+        .crlf(!q.multiline)
         .dot_matches_new_line(q.multiline);
     if !q.multiline {
         mb.line_terminator(Some(b'\n'));
     }
     let matcher = mb.build(&q.pattern).map_err(|e| format!("invalid {} pattern: {e}", q.kind))?;
-    let files = walk(root, q, true)?;
+    let files = walk(root, q, true, unreadable)?;
     use std::sync::atomic::{AtomicUsize, Ordering};
     let errors = AtomicUsize::new(0);
     let hits: Vec<(PathBuf, Collect)> = files
         .into_par_iter()
         .filter_map(|f| {
+            // List modes print counts only, so they store no lines.
             let mut sink =
-                Collect { matcher: &matcher, cap: max, lines: Vec::new(), stored: 0, count: 0, closed: false, binary: false };
+                Collect { matcher: &matcher, cap: if mode == "content" { max } else { 0 }, lines: Vec::new(), stored: 0, count: 0, closed: false, binary: false };
             if SearcherBuilder::new()
                 .binary_detection(BinaryDetection::quit(0))
                 .multi_line(q.multiline)
@@ -364,7 +369,7 @@ fn search(q: &Query, root: &Path, base: &Path, unreadable: &mut usize) -> Result
             (sink.count > 0 && !sink.binary).then_some((f, sink))
         })
         .collect();
-    *unreadable = errors.into_inner();
+    *unreadable += errors.into_inner();
     if hits.is_empty() {
         return Ok(Body::Text("(no matches)".into()));
     }
@@ -399,11 +404,20 @@ fn window(syms: &[(usize, usize, String)], n: usize, last: usize) -> (usize, usi
 
 /// Replaces matching lines (searched without context) by the union of their windows.
 fn widen(lines: &[Line], path: &Path, syms: &OnceCell<Vec<(usize, usize, String)>>, matcher: &RegexMatcher) -> Vec<Line> {
-    let Ok(text) = outline::read_text(path) else {
-        syms.get_or_init(Vec::new);
-        return lines.to_vec();
+    let (text, syms) = match outline::read_text(path) {
+        Ok(t) => {
+            let s = syms.get_or_init(|| outline::symbols_in(path, &t));
+            (t, s)
+        }
+        // Over 2 MB or binary-looking: no symbols, but still widen to a line window as before the cache.
+        Err(_) => {
+            let Ok(bytes) = fs::read(path) else {
+                syms.get_or_init(Vec::new);
+                return lines.to_vec();
+            };
+            (String::from_utf8_lossy(&bytes).into_owned(), syms.get_or_init(Vec::new))
+        }
     };
-    let syms = syms.get_or_init(|| outline::symbols_in(path, &text));
     let src: Vec<&str> = text.lines().collect();
     let mut keep: BTreeMap<usize, Line> = BTreeMap::new();
     for l in lines {
@@ -445,6 +459,18 @@ struct Hits {
 }
 
 const MAX_SIG: usize = 80;
+/// Consecutive hits that do not fit after which a fill round stops.
+const MAX_MISSES: usize = 16;
+
+/// Notice inputs kept up to date while hits are added: all hits, shown hits, files with
+/// hits not shown and the summed length of their notice items.
+#[derive(Clone, Copy)]
+struct Omitted {
+    total: usize,
+    done: usize,
+    files: usize,
+    items_len: usize,
+}
 
 fn is_doc(path: &str) -> bool {
     let ext = path.rsplit_once('.').map_or("", |(_, e)| e);
@@ -462,6 +488,7 @@ impl Hits {
         let stored: Vec<usize> = self.files.iter().map(|f| f.lines.iter().filter(|l| l.is_match).count()).collect();
         let (mut shown, mut blocks) = (vec![0; n], vec![String::new(); n]);
         let (mut used, mut total) = (0, 0); // `used`: block bytes, one newline each
+        let mut om = self.omitted(&shown);
         let mut tier = 0..self.split;
         let render = |i: usize, k: usize| {
             let f = &self.files[i];
@@ -472,7 +499,7 @@ impl Hits {
             self.block(i, k, lines, syms[i].get_or_init(|| outline::symbols(&f.abs)))
         };
         'fill: loop {
-            let before = total;
+            let (before, mut misses) = (total, 0);
             for i in tier.clone() {
                 if shown[i] == stored[i] {
                     continue;
@@ -481,13 +508,19 @@ impl Hits {
                     break 'fill;
                 }
                 let block = render(i, shown[i] + 1);
-                shown[i] += 1;
                 let next = used + block.len() + 1 - if blocks[i].is_empty() { 0 } else { blocks[i].len() + 1 };
-                if next + self.notice(&shown, room / 4).len() > room {
+                let om_next = self.step(om, i, shown[i]);
+                shown[i] += 1;
+                if next + self.notice(&shown, om_next, room / 4).len() > room {
                     shown[i] -= 1;
+                    // A smaller later file may still fit, but once the budget is full, stop looking.
+                    misses += 1;
+                    if misses == MAX_MISSES {
+                        break;
+                    }
                     continue;
                 }
-                (used, blocks[i], total) = (next, block, total + 1);
+                (used, blocks[i], total, om, misses) = (next, block, total + 1, om_next, 0);
             }
             if total == before {
                 if tier.end == n {
@@ -500,17 +533,17 @@ impl Hits {
             && let Some(i) = (0..n).find(|&i| stored[i] > 0)
         {
             shown[i] = 1;
-            let notice = self.notice(&shown, room / 4);
+            let notice = self.notice(&shown, self.omitted(&shown), room / 4);
             let avail = room.saturating_sub(if notice.is_empty() { 0 } else { notice.len() + 1 });
             if avail > 0 {
                 blocks[i] = budget::fold(&render(i, 1), avail);
                 notice
             } else {
                 shown[i] = 0;
-                self.notice(&shown, room)
+                self.notice(&shown, self.omitted(&shown), room)
             }
         } else {
-            self.notice(&shown, room.saturating_sub(used))
+            self.notice(&shown, om, room.saturating_sub(used))
         };
         let mut out: Vec<String> = blocks.into_iter().filter(|b| !b.is_empty()).collect();
         if !notice.is_empty() {
@@ -572,21 +605,38 @@ impl Hits {
         out.into_iter().map(|(_, s)| s.trim_end().to_string()).collect::<Vec<_>>().join("\n")
     }
 
+    /// Length of file `i`'s " path count" item in the notice when `s` of its hits are shown.
+    fn item_len(&self, i: usize, s: usize) -> usize {
+        let f = &self.files[i];
+        if f.count > s { 2 + f.path.len() + (f.count - s).ilog10() as usize + 1 } else { 0 }
+    }
+
+    /// What `notice` needs for `shown`, from scratch.
+    fn omitted(&self, shown: &[usize]) -> Omitted {
+        let mut om = Omitted { total: self.files.iter().map(|f| f.count).sum(), done: shown.iter().sum(), files: 0, items_len: 0 };
+        for (i, &s) in shown.iter().enumerate() {
+            om.files += usize::from(self.files[i].count > s);
+            om.items_len += self.item_len(i, s);
+        }
+        om
+    }
+
+    /// `om` after file `i` goes from `s` to `s + 1` shown hits.
+    fn step(&self, mut om: Omitted, i: usize, s: usize) -> Omitted {
+        om.done += 1;
+        om.items_len = om.items_len - self.item_len(i, s) + self.item_len(i, s + 1);
+        om.files -= usize::from(self.files[i].count == s + 1);
+        om
+    }
+
     /// Totals plus every file with hits not shown and how many, within `room`
     /// where possible; files that do not fit are summed up as one count.
-    fn notice(&self, shown: &[usize], room: usize) -> String {
-        let total: usize = self.files.iter().map(|f| f.count).sum();
-        let done: usize = shown.iter().sum();
+    fn notice(&self, shown: &[usize], om: Omitted, room: usize) -> String {
+        let (total, done, omitted_count) = (om.total, om.done, om.files);
         if done == total {
             return String::new();
         }
-        let (mut omitted_count, mut items_len) = (0usize, 0usize);
-        for (f, &s) in self.files.iter().zip(shown) {
-            if f.count > s {
-                items_len += usize::from(omitted_count > 0) + 2 + f.path.len() + (f.count - s).ilog10() as usize + 1;
-                omitted_count += 1;
-            }
-        }
+        let items_len = om.items_len + omitted_count.saturating_sub(1); // plus the separating commas
         let mut out = format!("... [truncated: showing {done} of {total} matching lines in {} files; not shown:", self.files.len());
         let all_fit = out.len() + items_len < room;
         let (mut listed, mut rest) = (0, total - done);
@@ -851,23 +901,9 @@ const GIT_OUT_CAP: u64 = 512 * 1024;
 
 fn run_git(pattern: &str, dir: &Path) -> Result<String, String> {
     let args = git_args(pattern)?;
-    let mut child = Command::new("git")
-        .args(["--no-pager", "--no-optional-locks"])
-        .args(
-            ["core.fsmonitor=false", "core.quotePath=false", "core.pager=cat", "diff.external=", "gpg.program=false",
-             "gpg.openpgp.program=false", "gpg.ssh.program=false", "gpg.x509.program=false"]
-                .iter()
-                .flat_map(|c| ["-c", c]),
-        )
+    let filters = snapshot::git_filters(dir, Instant::now() + Duration::from_secs(10)).ok_or("cannot read git filter config")?;
+    let mut child = snapshot::git_command(dir, &filters)
         .args(&args)
-        .current_dir(dir)
-        .env("GIT_PAGER", "cat")
-        .env("PAGER", "cat")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GCM_INTERACTIVE", "never")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env_remove("GIT_EXTERNAL_DIFF")
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1149,4 +1185,91 @@ mod tests {
         let out = run(json!({"cwd": dir.path(), "queries": [{"type": "text", "pattern": "hit", "definition": true}], "maxChars": 500})).unwrap();
         assert!(out.len() <= 500 && out.contains("b.rs") && out.contains("fn small()") && out.contains("showing 1 of 3"), "{out}");
     }
+
+    #[test]
+    fn definition_widens_oversized_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = format!("fn big_target() {{\n    let needle_here = 1;\n}}\n{}", "// xxx\n".repeat(300_000));
+        fs::write(dir.path().join("big.rs"), big).unwrap();
+        let out = call(dir.path(), json!([{"type": "text", "pattern": "needle_here", "definition": true}]));
+        assert!(out.contains("fn big_target() {") && out.contains("needle_here"), "{out}");
+    }
+
+    #[test]
+    fn multiline_matches_within_and_across_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "foo\nbar\n").unwrap();
+        let out = call(dir.path(), json!([{"type": "regex", "pattern": "fo+", "multiline": true}, {"type": "regex", "pattern": "foo\\nbar", "multiline": true}]));
+        let s: Vec<&str> = out.split("\n\n").collect();
+        assert!(s[0].ends_with("a.txt\n 1: foo") && s[1].ends_with("a.txt\n 1: foo\n 2: bar"), "{out}");
+    }
+
+    #[test]
+    fn notice_counts_stay_exact_when_many_files_do_not_fit() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..300 {
+            fs::write(dir.path().join(format!("f{i:03}.txt")), "hit\n".repeat(1 + i % 3)).unwrap();
+        }
+        let out = untip(run(json!({"cwd": dir.path(), "queries": [{"type": "text", "pattern": "hit"}], "maxChars": 2000})).unwrap());
+        assert!(out.len() <= 2000, "{}", out.len());
+        let notice = out.lines().last().unwrap();
+        let shown = out.matches(": hit").count();
+        assert!(notice.starts_with(&format!("... [truncated: showing {shown} of 600 matching lines in 300 files; not shown:")), "{notice}");
+        // Listed per-file counts plus the summed-up rest cover exactly the hidden lines.
+        let list = notice.split("not shown:").nth(1).unwrap().trim_end_matches(']');
+        let (mut lines, mut files) = (0, 0);
+        for item in list.split(',') {
+            let w: Vec<&str> = item.split_whitespace().collect();
+            if let Some(rest) = item.trim().strip_prefix('+') {
+                files += rest.split(' ').next().unwrap().parse::<usize>().unwrap();
+                lines += w[2].trim_start_matches('(').parse::<usize>().unwrap();
+            } else {
+                files += 1;
+                lines += w[1].parse::<usize>().unwrap();
+            }
+        }
+        assert_eq!(lines, 600 - shown, "{notice}");
+        let mut shown_in = std::collections::HashMap::new();
+        let mut file = "";
+        for l in out.lines() {
+            if l.starts_with('f') {
+                file = l;
+            } else if l.contains(": hit") {
+                *shown_in.entry(file).or_insert(0) += 1;
+            }
+        }
+        let full = (0..300).filter(|i| shown_in.get(format!("f{i:03}.txt").as_str()) == Some(&(1 + i % 3))).count();
+        assert_eq!(files, 300 - full, "{notice}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_directories_are_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("h.txt"), "needle\n").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = fs::read_dir(&locked).is_ok(); // root ignores the mode
+        let out = call(dir.path(), json!([{"type": "text", "pattern": "needle"}]));
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        if !readable {
+            assert_eq!(out, "## Query 1 [text] needle\nIncomplete search: 1 unreadable file(s).\n(no matches)");
+        }
+    }
+
+    #[test]
+    fn whitespace_patterns_work_for_text_and_regex_only() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "a\tb\n").unwrap();
+        let out = call(dir.path(), json!([
+            {"type": "text", "pattern": "\t"}, {"type": "regex", "pattern": "\t"}, {"type": "text", "pattern": ""},
+            {"type": "fuzzy", "pattern": " "}, {"type": "glob", "pattern": "\t"},
+        ]));
+        let s: Vec<&str> = out.split("\n\n").collect();
+        assert!(s[0].ends_with("a.txt\n 1: a\tb") && s[1].ends_with("a.txt\n 1: a\tb"), "{out}");
+        assert!(s[2..].iter().all(|q| q.ends_with("Error: pattern must not be empty")), "{out}");
+    }
 }
+

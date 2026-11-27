@@ -5,8 +5,9 @@ on:
   push:
     tags: ["v*"]
 
+# Build jobs run third-party build scripts: read-only token, no stored credentials.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -21,6 +22,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Toolchain
         run: rustup update stable && rustup default stable && rustup target add ${{ matrix.target }}
       - name: Test
@@ -52,6 +55,8 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:

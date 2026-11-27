@@ -215,7 +215,7 @@ fn search_reports_exclusive_lock_alongside_readable_hits() {
 }
 
 #[test]
-fn bash_hook_obeys_child_status() {
+fn bash_hook_chain_follows_filter_verdict() {
     let bash = std::env::var_os("ProgramFiles").map(PathBuf::from).map(|d| d.join(r"Git\bin\bash.exe"));
     let Some(bash) = bash.filter(|p| p.is_file()) else { return };
     let dir = tempfile::tempdir().unwrap();
@@ -223,7 +223,8 @@ fn bash_hook_obeys_child_status() {
     let hook = run_with_stdin(&["hook", "pre-bash"], dir.path(), input.to_string().as_bytes(), &[]);
     let response: Value = serde_json::from_slice(&hook.stdout).unwrap();
     let command = response["hookSpecificOutput"]["updatedInput"]["command"].as_str().unwrap();
-    for (body, code, verdict) in [("return 5", 5, "FAIL"), ("printf '1 failed'; return 0", 0, "PASS")] {
+    // The filter judges the output: the pipeline's status is its verdict, not the child's exit code.
+    for (body, code, verdict) in [("printf '1 failed'; return 5", 1, "FAIL"), ("printf '3 passed'; return 0", 0, "PASS")] {
         let output = Command::new(&bash).args(["-c", &format!("pytest() {{ {body}; }}; {command}")]).current_dir(dir.path()).output().unwrap();
         assert_eq!(output.status.code(), Some(code), "{}", String::from_utf8_lossy(&output.stderr));
         assert!(String::from_utf8_lossy(&output.stdout).contains(&format!("[agyfast-rs {verdict}]")));
