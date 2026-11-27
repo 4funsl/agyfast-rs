@@ -29,7 +29,9 @@ jobs:
         run: rustup update stable && rustup default stable && rustup component add clippy
       - name: Crate and plugin versions match
         shell: bash
-        run: v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1) && grep -q "\"version\": \"$v\"" plugin/plugin.json
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          grep -q "\"version\": \"$v\"" plugin/plugin.json
       - name: Test
         run: cargo test --locked
       - name: Clippy
