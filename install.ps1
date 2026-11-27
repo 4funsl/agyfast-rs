@@ -44,8 +44,8 @@ function Write-Json([string]$path, $value) {
   [IO.File]::WriteAllText($path, ($value | ConvertTo-Json -Depth 20), (New-Object Text.UTF8Encoding $false))
 }
 $mcp = Get-Content (Join-Path $root "plugin\mcp_config.json") -Raw | ConvertFrom-Json
-$mcp.mcpServers.rs.command = $pluginExe
-$mcp.mcpServers.rs.args = @("mcp")
+$mcp.mcpServers.code.command = $pluginExe
+$mcp.mcpServers.code.args = @("mcp")
 Write-Json (Join-Path $pluginDir "mcp_config.json") $mcp
 $hooks = Get-Content (Join-Path $root "plugin\hooks.json") -Raw | ConvertFrom-Json
 $hooks.'agyfast-rs-snapshot'.SessionStart[0].command = "`"$pluginExe`" hook session-start"
@@ -62,6 +62,6 @@ Write-Host "Installed CLI:    $cliDir\agyfast-rs.exe"
 if (-not (($env:PATH -split ';') -contains $cliDir)) { Write-Host "Add $cliDir to PATH to call agyfast-rs from a terminal." }
 $gitSh = @("bin", "usr\bin") | ForEach-Object { Join-Path $env:ProgramFiles "Git\$_\sh.exe" } | Where-Object { Test-Path $_ }
 if (-not (Get-Command sh -ErrorAction SilentlyContinue) -and -not $gitSh) {
-  Write-Warning "sh was not found (not on PATH, not in Git for Windows). run_checks and apply_edits' verify will run commands through cmd.exe, where POSIX shell syntax (quotes, &&, pipes to sh tools) may not work: install Git for Windows."
+  Write-Warning "sh was not found (not on PATH, not in Git for Windows). check and edit's verify will run commands through cmd.exe, where POSIX shell syntax (quotes, &&, pipes to sh tools) may not work: install Git for Windows."
 }
 Write-Host "Restart Antigravity, then check with: agy plugin list"

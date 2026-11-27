@@ -100,10 +100,13 @@ spills to disk and no single result crowds out the rest.
 
 | Tool | One call does | Notable |
 | :--- | :--- | :--- |
-| **`batch_search`** | 1–20 text, regex, glob, fuzzy-path or read-only `git` queries, concurrently | Source files before docs; `definition: true` returns each hit with its enclosing function or type |
-| **`quick_outline`** | Symbols and line ranges for up to 40 files | Rust, TypeScript/JavaScript, Python, Go, JSON/TOML/YAML, Markdown; `file#Name` returns that definition's source |
-| **`apply_edits`** | Exact-match edits or new files across up to 50 files, then an optional `verify` command | Atomic and file-locked; a target that matches more than once is rejected, never applied to every match |
-| **`run_checks`** | 1–12 build, test or lint commands concurrently, with timeouts | Output compressed to errors and a summary; `&&` chains run in order |
+| **`search`** | 1–20 text, regex, glob, fuzzy-path or read-only `git` queries, concurrently | Source files before docs; `definition: true` returns each hit with its enclosing function or type |
+| **`outline`** | Symbols and line ranges for up to 40 files | Rust, TypeScript/JavaScript, Python, Go, JSON/TOML/YAML, Markdown; `file#Name` returns that definition's source |
+| **`edit`** | Exact-match edits or new files across up to 50 files, then an optional `verify` command | Atomic and file-locked; a target that matches more than once is rejected, never applied to every match |
+| **`check`** | 1–12 build, test or lint commands concurrently, with timeouts | Output compressed to errors and a summary; `&&` chains run in order |
+
+In Antigravity they appear as `mcp_agyfast-rs_code_search` and so on. Releases up to 0.1.3 published them as
+`batch_search`, `quick_outline`, `apply_edits` and `run_checks`; those names still work.
 
 A `SessionStart` hook also gives the agent a short snapshot of the workspace (git state, layout),
 so it does not spend its first turns on `ls` and `git status`.
@@ -223,7 +226,7 @@ there.
 
 ### Does it send my code anywhere?
 No. It is a local stdio process that makes no network calls of its own and has no telemetry. `git` queries through
-`batch_search` are restricted to a read-only allowlist.
+`search` are restricted to a read-only allowlist.
 
 ### Which languages does it understand?
 Search, edits and checks are language-agnostic. Outlines and read-by-name use tree-sitter grammars

@@ -20,10 +20,10 @@ LEFT = dict(title="Antigravity, no plugin", secs=184, color=RED, stats="25 turns
     "cargo clippy (full output)", "edit_file src/mcp/schema.rs", "cargo test   (full output)",
     "… 51 tool calls in 25 turns"])
 RIGHT = dict(title="Antigravity + agyfast-rs", secs=146, color=ACCENT, stats="16 turns · 29 tool calls · 146 s · 207k tokens", lines=[
-    "batch_search  4 queries, definition: true", "run_checks    cargo test → 3 failures, summary",
-    "read_file     2 files", "apply_edits   5 files + verify: cargo test",
-    "batch_search  fn fit, definition: true", "apply_edits   2 files + verify",
-    "run_checks    build && clippy && test → ok", "… 29 tool calls in 16 turns"])
+    "search        4 queries, definition: true", "check         cargo test → 3 failures, summary",
+    "read_file     2 files", "edit          5 files + verify: cargo test",
+    "search        fn fit, definition: true", "edit          2 files + verify",
+    "check         build && clippy && test → ok", "… 29 tool calls in 16 turns"])
 
 
 def pct(t):

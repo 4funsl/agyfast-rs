@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "rs": {
+    "code": {
       "command": "sh",
       "args": [
         "-c",
@@ -8,16 +8,16 @@
         "${PLUGIN_ROOT}/bin/agyfast-rs"
       ],
       "tools": {
-        "batch_search": {
+        "search": {
           "eager": true
         },
-        "quick_outline": {
+        "outline": {
           "eager": true
         },
-        "apply_edits": {
+        "edit": {
           "eager": true
         },
-        "run_checks": {
+        "check": {
           "eager": true
         }
       }

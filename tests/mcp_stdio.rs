@@ -35,7 +35,7 @@ fn mcp_session_over_stdio() {
     assert!(replies[0]["result"]["capabilities"]["tools"].is_object());
     let tools = replies[1]["result"]["tools"].as_array().unwrap();
     assert_eq!(tools.len(), 4);
-    for name in ["batch_search", "quick_outline", "apply_edits", "run_checks"] {
+    for name in ["search", "outline", "edit", "check"] {
         assert!(tools.iter().any(|t| t["name"] == name), "missing {name}");
     }
     // toolSummary must not make the call a protocol error.

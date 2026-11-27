@@ -436,7 +436,7 @@ fn commit<'a>(plans: &'a [Plan], best_effort: bool, failed: &mut Vec<String>) ->
 }
 
 pub fn run(args: Value) -> Result<String, String> {
-    let a: Args = serde_json::from_value(args).map_err(|e| format!("Error: invalid apply_edits arguments (0 files modified): {e}"))?;
+    let a: Args = serde_json::from_value(args).map_err(|e| format!("Error: invalid edit arguments (0 files modified): {e}"))?;
     if !(1..=50).contains(&a.edits.len()) {
         return Err(format!("Error: `edits` must list 1-50 files, got {} (0 files modified)", a.edits.len()));
     }

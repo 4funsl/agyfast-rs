@@ -96,6 +96,13 @@ and two identical runs with the 0.1.4 build.
   `agyfast-rs` 16–19 turns, 141–146 s and 207–240k. The cost saving ranges from 9% to 24% depending
   on which pair of runs is compared; the turn and time savings were the same in every pair.
 
+- **Shorter tool names.** 0.1.4 as released publishes the tools as `search`, `outline`, `edit` and
+  `check` on a server named `code` (earlier `batch_search`, `quick_outline`, `apply_edits`,
+  `run_checks` on `rs`). Two further runs with these names gave 219,458 (18 turns, 149 s) and
+  197,005 (15 turns, 131 s), both 14/15: inside the range above, so no effect of the names is
+  shown. In half of all 0.1.4 runs, with either naming, the model made every edit with the
+  built-in `edit_file`; those runs cost about 20k more.
+
 ### Solo agent, hard task, Gemini 4 Hydrogen Medium
 
 | | No plugin | agyfast-rs (earlier build) |

@@ -70,7 +70,7 @@ struct Run {
 }
 
 pub fn run(args: Value) -> Result<String, String> {
-    let a: Args = serde_json::from_value(args).map_err(|e| format!("Error: invalid run_checks arguments: {e}"))?;
+    let a: Args = serde_json::from_value(args).map_err(|e| format!("Error: invalid check arguments: {e}"))?;
     if !(1..=12).contains(&a.commands.len()) {
         return Err(format!("Error: commands must hold 1-12 entries, got {}", a.commands.len()));
     }

@@ -57,15 +57,15 @@ const SKIP_DIRS: &[&str] = &[
     ".pytest_cache", ".mypy_cache", ".ruff_cache", ".gradle", ".idea",
 ];
 const MAX_LINE: usize = 240;
-const TIP: &str = "Tip: \"definition\": true on a query returns each hit's whole definition; quick_outline \"file#Name\" reads one by name.";
+const TIP: &str = "Tip: \"definition\": true on a query returns each hit's whole definition; outline \"file#Name\" reads one by name.";
 /// Longest definition shown whole by `definition: true`; longer ones are cut to ±CLIP lines around the hit.
 const WHOLE: usize = 60;
 const CLIP: usize = 10;
 
 pub fn run(args: Value) -> Result<String, String> {
-    let args: Args = serde_json::from_value(args).map_err(|e| format!("Error: invalid batch_search arguments: {e}"))?;
+    let args: Args = serde_json::from_value(args).map_err(|e| format!("Error: invalid search arguments: {e}"))?;
     if !(1..=20).contains(&args.queries.len()) {
-        return Err(format!("Error: batch_search takes 1-20 queries, got {}", args.queries.len()));
+        return Err(format!("Error: search takes 1-20 queries, got {}", args.queries.len()));
     }
     let base = cwd::resolve(args.cwd.as_deref())?;
     let parts: Vec<(String, Body)> = args

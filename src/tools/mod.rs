@@ -22,16 +22,17 @@ fn unwrap_stringified(args: &mut Value) {
     }
 }
 
-/// Single dispatch point shared by the MCP server and the CLI.
+/// Single dispatch point shared by the MCP server and the CLI. The short names are the
+/// published ones; the long names are what 0.1.0-0.1.4 published and stay as aliases.
 /// `Err` is a tool-level failure whose text is still shown to the model.
 pub fn call(name: &str, mut args: Value) -> Result<String, String> {
     unwrap_stringified(&mut args);
     let result = match name {
-        "batch_search" => search::run(args),
-        "quick_outline" => outline::run(args),
+        "search" | "batch_search" => search::run(args),
+        "outline" | "quick_outline" => outline::run(args),
         "read_slices" => slices::run(args),
-        "apply_edits" => edit::run(args),
-        "run_checks" => check::run(args),
+        "edit" | "apply_edits" => edit::run(args),
+        "check" | "run_checks" => check::run(args),
         other => Err(format!("Error: unknown tool `{other}`")),
     };
     // Last line of defence: no tool may exceed the inline cap.

@@ -16,7 +16,7 @@ pub fn tools() -> Value {
     let max_chars = json!({"type": "integer", "description": "Output byte cap, max 8800."});
     json!([
         tool(
-            "batch_search",
+            "search",
             "1-20 searches concurrently in one call; honors .gitignore. Content hits carry `Lstart-end` enclosing-symbol ranges. For hits you will read or edit set `definition: true` instead of following up with `read_file`.",
             &["queries"],
             json!({
@@ -40,7 +40,7 @@ pub fn tools() -> Value {
             }),
         ),
         tool(
-            "quick_outline",
+            "outline",
             "Symbols with line ranges for up to 40 files (Rust, TS/JS, Python, Go, JSON/TOML/YAML, Markdown headings). `file#Name[,Name]` returns those definitions' numbered source instead.",
             &["paths"],
             json!({
@@ -49,7 +49,7 @@ pub fn tools() -> Value {
             }),
         ),
         tool(
-            "apply_edits",
+            "edit",
             "Exact-match hunks or file creates for 1-50 files, atomic and locked, then an optional verify command.",
             &["edits"],
             json!({
@@ -75,7 +75,7 @@ pub fn tools() -> Value {
             }),
         ),
         tool(
-            "run_checks",
+            "check",
             "Run 1-12 non-interactive commands concurrently with timeouts; cargo, test-runner and linter output is compressed to errors and a summary. Use it for any build/test/lint command, even one; `&&` steps run in order.",
             &["commands"],
             json!({

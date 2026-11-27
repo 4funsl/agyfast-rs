@@ -83,7 +83,7 @@ mod tests {
         assert!(handle(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).is_none());
         let list = handle(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).unwrap();
         let names: Vec<&str> = list["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["batch_search", "quick_outline", "apply_edits", "run_checks"]);
+        assert_eq!(names, ["search", "outline", "edit", "check"]);
         // read_slices is unlisted but still answers a host that calls it.
         let slices = handle(&json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "read_slices", "arguments": {"lineRanges": ["Cargo.toml:1-2"]}}})).unwrap();
         assert_eq!(slices["result"]["isError"], false, "{slices}");
